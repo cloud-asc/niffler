@@ -72,6 +72,14 @@ pub struct ScanArgs {
     #[arg(short = 'T', long = "target-file")]
     pub target_file: Option<String>,
 
+    /// Hosts to exclude: IP addresses, hostnames, or CIDR ranges
+    #[arg(short = 'x', long, num_args = 1..)]
+    pub exclude: Option<Vec<String>>,
+
+    /// Read hosts to exclude from file (one per line), use '-' for stdin
+    #[arg(short = 'X', long = "exclude-file")]
+    pub exclude_file: Option<String>,
+
     /// Scan local/mounted paths instead of discovering NFS shares
     #[arg(short = 'i', long, num_args = 1..)]
     pub local_path: Option<Vec<PathBuf>>,
@@ -290,6 +298,35 @@ mod tests {
     fn privileged_port_can_be_disabled() {
         let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--no-privileged-port"]);
         assert!(args.no_privileged_port);
+    }
+
+    #[test]
+    fn exclude_accepts_multiple_specs() {
+        let args = parse_scan(&[
+            "niffler",
+            "scan",
+            "-t",
+            "10.0.0.0/24",
+            "-x",
+            "10.0.0.5",
+            "10.0.0.99",
+            "nfs-old",
+        ]);
+        let excludes = args.exclude.expect("exclude should be set");
+        assert_eq!(excludes, vec!["10.0.0.5", "10.0.0.99", "nfs-old"]);
+    }
+
+    #[test]
+    fn exclude_file_flag_parses() {
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "-X", "skip.txt"]);
+        assert_eq!(args.exclude_file.as_deref(), Some("skip.txt"));
+    }
+
+    #[test]
+    fn exclude_defaults_to_none() {
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1"]);
+        assert!(args.exclude.is_none());
+        assert!(args.exclude_file.is_none());
     }
 
     #[test]

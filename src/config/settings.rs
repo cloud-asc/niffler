@@ -71,6 +71,8 @@ impl OperatingMode {
 pub struct DiscoveryConfig {
     pub targets: Option<Vec<String>>,
     pub target_file: Option<String>,
+    pub excludes: Option<Vec<String>>,
+    pub exclude_file: Option<String>,
     pub nfs_version: Option<u8>,
     pub privileged_port: bool,
     pub discovery_tasks: usize,
@@ -219,6 +221,8 @@ impl NifflerConfig {
             discovery: DiscoveryConfig {
                 targets: args.targets,
                 target_file: args.target_file,
+                excludes: args.exclude,
+                exclude_file: args.exclude_file,
                 nfs_version: args.nfs_version,
                 privileged_port: !args.no_privileged_port,
                 discovery_tasks: args.discovery_tasks,
@@ -693,6 +697,59 @@ mod tests {
         let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1"]);
         let config = NifflerConfig::from_scan_args(args).unwrap();
         assert_eq!(config.discovery.nfs_version, None);
+    }
+
+    #[test]
+    fn config_from_scan_args_maps_excludes() {
+        let args = parse_scan(&[
+            "niffler",
+            "scan",
+            "-t",
+            "10.0.0.0/24",
+            "-x",
+            "10.0.0.5",
+            "10.0.0.99",
+            "-X",
+            "skip.txt",
+        ]);
+        let config = NifflerConfig::from_scan_args(args).unwrap();
+        assert_eq!(
+            config.discovery.excludes.as_deref(),
+            Some(["10.0.0.5".to_string(), "10.0.0.99".to_string()].as_slice())
+        );
+        assert_eq!(config.discovery.exclude_file.as_deref(), Some("skip.txt"));
+    }
+
+    #[test]
+    fn config_excludes_round_trip() {
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.0/24", "-x", "10.0.0.5"]);
+        let config = NifflerConfig::from_scan_args(args).unwrap();
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        let restored: NifflerConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(
+            restored.discovery.excludes.as_deref(),
+            Some(["10.0.0.5".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn config_without_exclude_keys_still_loads() {
+        // A config produced before exclusion support has no excludes/exclude_file
+        // keys. toml omits None values, so a default config reproduces that shape.
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1"]);
+        let config = NifflerConfig::from_scan_args(args).unwrap();
+        let toml_str = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !toml_str.contains("excludes"),
+            "None excludes should be omitted"
+        );
+        assert!(
+            !toml_str.contains("exclude_file"),
+            "None exclude_file omitted"
+        );
+        let restored: NifflerConfig = toml::from_str(&toml_str).expect("deserialize");
+        assert!(restored.discovery.excludes.is_none());
+        assert!(restored.discovery.exclude_file.is_none());
     }
 
     // ── Bug 2.3: parse_proxy_url hostname support ───────────────────

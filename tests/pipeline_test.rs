@@ -319,6 +319,35 @@ async fn pipeline_all_triage_levels_in_output() {
 }
 
 #[tokio::test]
+async fn pipeline_errors_when_all_targets_excluded() {
+    let mut config = helpers::test_config(OperatingMode::Scan);
+    config.output.db_path = std::env::temp_dir().join("niffler_pipeline_all_excluded.db");
+    // Single target that is also fully excluded — run_pipeline must fail fast.
+    config.discovery.targets = Some(vec!["10.0.0.1".to_string()]);
+    config.discovery.excludes = Some(vec!["10.0.0.1".to_string()]);
+
+    let token = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_pipeline(config, placeholder_connector(), Some(token), None),
+    )
+    .await;
+
+    assert!(result.is_ok(), "pipeline should not timeout");
+    let inner = result.unwrap();
+    assert!(
+        inner.is_err(),
+        "pipeline must return Err when all targets are excluded"
+    );
+    let err_msg = inner.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("all targets were excluded"),
+        "error message should mention 'all targets were excluded', got: {err_msg}"
+    );
+}
+
+#[tokio::test]
 async fn pipeline_binary_file_skips_text_rules() {
     let tmp = helpers::scan_tempdir();
 

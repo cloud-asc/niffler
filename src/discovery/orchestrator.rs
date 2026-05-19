@@ -157,10 +157,15 @@ async fn process_host_exports(
     Ok(())
 }
 
-/// Full discovery orchestrator: resolve targets, scan ports, list exports, harvest UIDs,
+/// Full discovery orchestrator: scan ports, list exports, harvest UIDs,
 /// detect misconfigurations, and emit ExportMsg for each discovered export.
+///
+/// Targets are resolved by the pipeline orchestrator before this function is
+/// called, so that a config error (e.g. all targets excluded) fails the run
+/// with a clear message rather than being silently swallowed.
 pub async fn run(
     config: &NifflerConfig,
+    targets: Vec<crate::discovery::TargetHost>,
     export_tx: Sender<ExportMsg>,
     result_tx: Sender<ResultMsg>,
     token: CancellationToken,
@@ -168,7 +173,6 @@ pub async fn run(
     rules: Arc<RuleEngine>,
 ) -> Result<()> {
     let proxy = config.discovery.proxy;
-    let targets = super::targets::resolve_targets(&config.discovery).await?;
     info!(count = targets.len(), "resolved targets for scanning");
     if targets.is_empty() {
         warn!("no targets resolved — check -t/--target-file arguments");

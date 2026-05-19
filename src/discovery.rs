@@ -13,7 +13,7 @@ pub use orchestrator::run;
 pub use rpcbind::{RpcServices, query_rpc_services};
 pub use scanner::{PortScanResult, scan_host, scan_hosts};
 pub use targets::{
-    TargetHost, resolve_single_target, resolve_targets, resolve_targets_from_file,
-    resolve_targets_from_list,
+    TargetHost, resolve_exclusions, resolve_single_target, resolve_targets,
+    resolve_targets_from_file, resolve_targets_from_list,
 };
 pub use uid_harvest::{extract_unique_creds, harvest_uids};

@@ -50,6 +50,8 @@ pub fn test_config(mode: OperatingMode) -> NifflerConfig {
         discovery: DiscoveryConfig {
             targets: None,
             target_file: None,
+            excludes: None,
+            exclude_file: None,
             nfs_version: None,
             privileged_port: false,
             discovery_tasks: 2,

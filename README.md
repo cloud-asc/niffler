@@ -90,6 +90,12 @@ Niffler runs in three modes, so you can dial in how deep you want to go:
 # Read targets from stdin
 cat targets.txt | ./niffler scan -T -
 
+# Scan a subnet but skip specific hosts
+./niffler scan -t 10.0.0.0/24 -x 10.0.0.5 10.0.0.99
+
+# Exclude hosts listed in a file (one per line, supports CIDR)
+./niffler scan -t 10.0.0.0/24 -X exclude.txt
+
 # Check for subtree_check bypass (filehandle escape from export boundary)
 ./niffler scan -t 192.168.0.0/16 --check-subtree-bypass
 
@@ -284,6 +290,8 @@ During discovery, Niffler probes each export for common NFS misconfigurations:
 | `-t, --targets` | IP addresses, hostnames, or CIDR ranges | — |
 | `-T, --target-file` | Read targets from file (one per line, `-` for stdin) | — |
 | `-i, --local-path` | Scan local/mounted paths instead of NFS discovery | — |
+| `-x, --exclude` | Hosts to exclude: IP addresses, hostnames, or CIDR ranges | — |
+| `-X, --exclude-file` | Read hosts to exclude from file (one per line, `-` for stdin) | — |
 
 #### Mode & Output
 

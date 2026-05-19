@@ -55,6 +55,14 @@ pub async fn run_pipeline(
     multi: Option<MultiProgress>,
 ) -> Result<PipelineStats, PipelineError> {
     let rules = Arc::new(build_rules(&config)?);
+
+    // Resolve scan targets up front so a target/exclusion config error
+    // (e.g. all targets excluded) fails the run with a clear message
+    // instead of being swallowed by the discovery phase.
+    let targets = discovery::resolve_targets(&config.discovery)
+        .await
+        .map_err(|e| PipelineError::Config(e.to_string()))?;
+
     let channels = PipelineChannels::default();
     let stats = Arc::new(PipelineStats::default());
 
@@ -106,7 +114,7 @@ pub async fn run_pipeline(
         let config = Arc::clone(&config);
         let rules = Arc::clone(&rules);
         tokio::spawn(async move {
-            discovery::run(&config, export_tx, result_tx, token, stats, rules).await
+            discovery::run(&config, targets, export_tx, result_tx, token, stats, rules).await
         })
     };
 
@@ -342,6 +350,8 @@ mod tests {
             discovery: DiscoveryConfig {
                 targets: None,
                 target_file: None,
+                excludes: None,
+                exclude_file: None,
                 nfs_version: None,
                 privileged_port: false,
                 discovery_tasks: 10,
