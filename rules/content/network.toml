@@ -15,10 +15,19 @@ patterns = [
 
     # JDBC URL (already well-formed)
     "(?i)jdbc:(mysql|postgresql|oracle|sqlserver|mariadb)://[^\\s\"']{10,}",
+
+    # curl -u/--user user:password (basic-auth on the command line)
+    '(?i)curl\b[^\n]{0,200}\s(?:-u|--user)\s+[^\s:"]+:[^\s"]{4,}',
 ]
 action = "Snaffle"
 triage = "Red"
 skip_comments = true
+exclude_patterns = [
+    # curl -u/--user placeholders: word-pair creds, <template>, and $var/${var}/[VAR] values
+    '(?i)(?:-u|--user)\s+["]?<',
+    '(?i)(?:-u|--user)\s+[^\s:"]*:(?:password|passwd|token|test|pass|secret|username|user|changeme|example|xxx)\b',
+    '(?i)(?:-u|--user)\s+[^\s"]*:[$\[{<]',
+]
 exclude_file_paths = [
     '(?i)\.(htm|html|pod|[1-9]|msg)$',
     '(?i)/help/',

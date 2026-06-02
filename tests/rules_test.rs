@@ -485,7 +485,7 @@ fn slack_webhook_pattern_matches() {
     let engine = engine_with_relay("TestRelayToTokens", "yaml", "TokenPatterns");
     let entry = file_entry("config.yaml", "/data/config.yaml", 256, 1000, 1000, 0o644);
     let content =
-        b"webhook: https://hooks.slack.com/services/T0123ABCD/B0123ABCD/xxxxxxxxxxxxxxxxxxx1";
+        b"webhook: https://hooks.slack.com/services/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";
     let findings = engine.evaluate_file(&entry, Some(content));
     assert!(
         findings.iter().any(|f| f.rule_name == "TokenPatterns"),

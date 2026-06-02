@@ -443,3 +443,24 @@ patterns = ["j2", "jinja", "jinja2", "erb", "twig"]
 action = "Relay"
 relay_targets = ["CredentialPatterns", "CloudKeyPatterns"]
 description = "Template files -- Ansible Jinja, Rails ERB, PHP Twig may embed credentials"
+
+[[rules]]
+name = "DiagnosticSecretFiles"
+scope = "FileEnumeration"
+match_location = "FileName"
+match_type = "Exact"
+patterns = [
+    ".netrc",
+    ".pgpass",
+    ".git-credentials",
+    ".dockercfg",
+    ".esmtprc",
+    "master.key",
+    "logins.json",
+    "recentservers.xml",
+    "sitemanager.xml",
+    "filezilla.xml",
+]
+action = "Snaffle"
+triage = "Red"
+description = "Files whose name alone reliably indicates stored credentials -- netrc, pgpass, git-credentials, dockercfg, Rails master.key, Firefox logins, FileZilla server lists"

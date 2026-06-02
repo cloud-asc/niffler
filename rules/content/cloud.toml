@@ -10,9 +10,12 @@ patterns = [
     '(?i)private_key_id\s*[":]\s*[a-f0-9]{40}',
     "(?i)azure[_.]?(tenant|client|subscription)[_.]?id\\s*[=:]\\s*[\"']?[0-9a-f-]{36}",
     "(?i)client_secret\\s*[=:]\\s*[\"']?[A-Za-z0-9\\-._~]{32,}",
-    '(?i)sk_live_[A-Za-z0-9]{24,}',
-    'sk_test_[A-Za-z0-9]{24,}',
-    'AIza[0-9A-Za-z_-]{35}',
+    '[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}',
+    '(?i)\bsk_live_[A-Za-z0-9]{24,}',
+    '\bsk_test_[A-Za-z0-9]{24,}',
+    '\brk_(live|test|prod)_[A-Za-z0-9]{20,}',
+    '\bsk_prod_[A-Za-z0-9]{20,}',
+    '\bAIza[0-9A-Za-z_-]{35}\b',
     'dop_v1_[a-f0-9]{64}',
 ]
 action = "Snaffle"
@@ -21,6 +24,7 @@ skip_comments = true
 exclude_patterns = [
     '(?i)(example|sample|placeholder|your.?key|test.?key|dummy|CHANGE.?ME)',
     '(?i)AKIAIOSFODNN7EXAMPLE',
+    '(?i)x{4,}',
 ]
 max_size = 1048576
 context_bytes = 200

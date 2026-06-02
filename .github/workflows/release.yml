@@ -78,6 +78,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -86,10 +90,18 @@ jobs:
       - name: Create SHA256SUMS
         run: cat artifacts/*.sha256 > artifacts/SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
         with:
-          generate_release_notes: true
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: RELEASE_NOTES.md
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS
