@@ -1,6 +1,17 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script>
+    (function () {
+        try {
+            var t = localStorage.getItem('niffler-theme');
+            if (t !== 'light' && t !== 'dark') t = 'dark';
+            document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+            document.documentElement.setAttribute('data-theme', 'dark');
+        }
+    })();
+    </script>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}Niffler{% endblock %}</title>
@@ -57,6 +68,125 @@
             }
         }
     }
+    function toggleTheme() {
+        var root = document.documentElement;
+        var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        try { localStorage.setItem('niffler-theme', next); } catch (e) {}
+        var btn = document.getElementById('theme-toggle');
+        if (btn) btn.textContent = next === 'light' ? '☽' : '☀';
+    }
+    document.addEventListener('DOMContentLoaded', function () {
+        var btn = document.getElementById('theme-toggle');
+        if (!btn) return;
+        var cur = document.documentElement.getAttribute('data-theme');
+        btn.textContent = cur === 'light' ? '☽' : '☀';
+    });
+    function _selectedIds() {
+        return Array.prototype.slice
+            .call(document.querySelectorAll('.row-select:checked'))
+            .map(function (c) { return c.value; });
+    }
+    function onRowSelectChange() {
+        var ids = _selectedIds();
+        var hidden = document.getElementById('bulk-ids');
+        if (hidden) hidden.value = ids.join(',');
+        var n = document.getElementById('bulk-count-n');
+        if (n) n.textContent = ids.length;
+        var bar = document.getElementById('bulk-bar');
+        if (bar) bar.style.display = ids.length > 0 ? '' : 'none';
+    }
+    function onSelectAllChange(master) {
+        Array.prototype.slice.call(document.querySelectorAll('.row-select'))
+            .forEach(function (c) { c.checked = master.checked; });
+        onRowSelectChange();
+    }
+    document.addEventListener('htmx:afterSwap', function (e) {
+        if (e.target && e.target.id === 'findings-tbody') {
+            var master = document.getElementById('select-all');
+            if (master) master.checked = false;
+            onRowSelectChange();
+            _kbFocus = -1;
+        }
+    });
+    var _kbFocus = -1;
+    function _rows() {
+        return Array.prototype.slice.call(document.querySelectorAll('#findings-tbody tr.findings-row'));
+    }
+    function _setFocus(i) {
+        var rows = _rows();
+        if (!rows.length) return;
+        if (i < 0) i = 0;
+        if (i > rows.length - 1) i = rows.length - 1;
+        rows.forEach(function (r) { r.classList.remove('kb-focus'); });
+        _kbFocus = i;
+        rows[i].classList.add('kb-focus');
+        rows[i].scrollIntoView({ block: 'nearest' });
+    }
+    function _focusedRow() {
+        var rows = _rows();
+        return (_kbFocus >= 0 && _kbFocus < rows.length) ? rows[_kbFocus] : null;
+    }
+    document.addEventListener('keydown', function (e) {
+        if (!document.getElementById('findings-tbody')) return;
+        var el = e.target;
+        var tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'button' || tag === 'a' || el.isContentEditable) return;
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        var row = _focusedRow();
+        switch (e.key) {
+            case 'j': _setFocus(_kbFocus + 1); e.preventDefault(); break;
+            case 'k': _setFocus(_kbFocus < 0 ? _rows().length - 1 : _kbFocus - 1); e.preventDefault(); break;
+            case 'x':
+                if (row) { var c = row.querySelector('.row-select'); if (c) { c.checked = !c.checked; onRowSelectChange(); } }
+                e.preventDefault(); break;
+            case 'e':
+                if (row) { var t = row.querySelector('.expand-toggle'); if (t) t.click(); }
+                e.preventDefault(); break;
+            case 's':
+                if (row) { var s = row.querySelector('.star-btn'); if (s) s.click(); }
+                e.preventDefault(); break;
+            case 'u':
+                if (row) { var rv = row.querySelector('.review-btn'); if (rv) rv.click(); }
+                e.preventDefault(); break;
+            default: break;
+        }
+    });
+    function exportSelected(fmt) {
+        var hidden = document.getElementById('bulk-ids');
+        var ids = hidden ? hidden.value : '';
+        if (!ids) return;
+        window.location = '/api/export/' + fmt + '?ids=' + encodeURIComponent(ids);
+    }
+    function copyToClipboard(btn) {
+        var text = btn.getAttribute('data-copy') || '';
+        var flash = function (msg, ok) {
+            var label = btn.textContent;
+            btn.textContent = msg;
+            if (ok) btn.classList.add('copied');
+            setTimeout(function () { btn.textContent = label; btn.classList.remove('copied'); }, 1200);
+        };
+        var fallback = function () {
+            try {
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                flash(ok ? 'Copied' : 'Copy failed', ok);
+            } catch (e) {
+                flash('Copy failed', false);
+            }
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () { flash('Copied', true); }).catch(fallback);
+        } else {
+            fallback();
+        }
+    }
     </script>
 </head>
 <body>
@@ -69,6 +199,8 @@
             <li><a href="/hosts" class="nav-link{% if active_nav == "hosts" %} active{% endif %}">Hosts</a></li>
             <li><a href="/scans" class="nav-link{% if active_nav == "scans" %} active{% endif %}">Scans</a></li>
         </ul>
+        <button id="theme-toggle" class="theme-toggle" type="button"
+                onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9728;</button>
     </nav>
     <main class="page">
         {% block content %}{% endblock %}

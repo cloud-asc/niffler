@@ -1,0 +1,17 @@
+<span class="pagination-info">Showing {{ showing_start }}&ndash;{{ showing_end }} of {{ total }}</span>
+<div class="pagination-controls">
+{% if page > 1 %}
+<button class="pagination-btn"
+    hx-get="/api/findings?page={{ page - 1 }}&amp;per_page={{ per_page }}&amp;triage={{ current_triage }}&amp;host={{ current_host }}&amp;rule={{ current_rule }}&amp;q={{ current_q }}&amp;sort={{ current_sort }}&amp;dir={{ current_dir }}&amp;show={{ current_show }}"
+    hx-target="#findings-tbody" hx-swap="innerHTML">&larr; Prev</button>
+{% else %}
+<button class="pagination-btn" disabled>&larr; Prev</button>
+{% endif %}
+{% if page < total_pages %}
+<button class="pagination-btn"
+    hx-get="/api/findings?page={{ page + 1 }}&amp;per_page={{ per_page }}&amp;triage={{ current_triage }}&amp;host={{ current_host }}&amp;rule={{ current_rule }}&amp;q={{ current_q }}&amp;sort={{ current_sort }}&amp;dir={{ current_dir }}&amp;show={{ current_show }}"
+    hx-target="#findings-tbody" hx-swap="innerHTML">Next &rarr;</button>
+{% else %}
+<button class="pagination-btn" disabled>Next &rarr;</button>
+{% endif %}
+</div>

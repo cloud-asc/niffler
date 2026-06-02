@@ -45,10 +45,9 @@ pub async fn check_insecure_export(
     export: &str,
     proxy: Option<SocketAddr>,
 ) -> Option<Misconfiguration> {
-    // Create a connector that does NOT use a privileged port
     let connector = match proxy {
         Some(addr) => Nfs3Connector::with_proxy(addr),
-        None => Nfs3Connector::new(false), // privileged_port = false
+        None => Nfs3Connector::new(false),
     };
     let mut ops = match connector.connect(host, export, &AuthCreds::nobody()).await {
         Ok(ops) => ops,
@@ -203,7 +202,8 @@ mod tests {
     #[ignore = "requires NFS server — check_insecure_export makes real TCP connection"]
     async fn insecure_export_detected_when_unprivileged_connects() {
         // This test requires a real NFS server with `insecure` option.
-        let result = check_insecure_export("localhost", "/export", None).await;
+        // Use a literal IP: the v3 connect path expects an address, not a hostname.
+        let result = check_insecure_export("127.0.0.1", "/srv/export", None).await;
         assert_eq!(result, Some(Misconfiguration::InsecureExport));
     }
 
@@ -211,7 +211,8 @@ mod tests {
     #[ignore = "requires NFS server — check_insecure_export makes real TCP connection"]
     async fn insecure_export_absent_when_unprivileged_rejected() {
         // This test requires a real NFS server that rejects unprivileged ports.
-        let result = check_insecure_export("localhost", "/secure_export", None).await;
+        // Use a literal IP: the v3 connect path expects an address, not a hostname.
+        let result = check_insecure_export("127.0.0.1", "/srv/secure_export", None).await;
         assert_eq!(result, None);
     }
 

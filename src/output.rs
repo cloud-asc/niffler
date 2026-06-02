@@ -1,4 +1,3 @@
-pub mod console;
 pub mod export;
 pub mod sqlite;
 pub mod types;
@@ -7,107 +6,101 @@ pub use types::DeduplicationKey;
 pub use types::file_mode_to_rwx;
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::config::OutputConfig;
-use crate::pipeline::{PipelineStats, ResultMsg};
+use crate::pipeline::{ExportMsg, PipelineStats, ResultMsg};
+use crate::tui::{FindingEvent, ReporterHandle};
 
 use self::sqlite::SqliteWriter;
 
-/// Async output sink — reads `ResultMsg` from the pipeline channel, writes
-/// every finding to SQLite, and optionally tees to a console writer when
-/// `config.live` is set.
-///
-/// SQLite deduplication is handled by the database UNIQUE constraint.
-/// Console deduplication uses an in-memory `HashSet<DeduplicationKey>`.
+/// Async output sink — reads `ResultMsg` and `ExportMsg` from the pipeline
+/// channels, writes findings and export metadata to SQLite, and tees findings
+/// (post severity-filter) to the reporter for live display.
 pub async fn run(
     rx: mpsc::Receiver<ResultMsg>,
+    export_meta_rx: mpsc::Receiver<ExportMsg>,
     config: &OutputConfig,
     targets: &[String],
     mode: &str,
     stats: Arc<PipelineStats>,
+    reporter: ReporterHandle,
 ) -> Result<()> {
-    let console_writer: Option<Box<dyn Write + Send>> = if config.live {
-        Some(Box::new(std::io::stdout()))
-    } else {
-        None
-    };
-    run_inner(rx, config, targets, mode, stats, console_writer).await
+    run_inner(rx, export_meta_rx, config, targets, mode, stats, reporter).await
 }
 
 /// Batch size for SQLite inserts — balance between latency and throughput.
 const WRITE_BATCH_SIZE: usize = 500;
 
-/// Inner implementation that accepts an injected console writer for testability.
 async fn run_inner(
     mut rx: mpsc::Receiver<ResultMsg>,
+    mut export_meta_rx: mpsc::Receiver<ExportMsg>,
     config: &OutputConfig,
     targets: &[String],
     mode: &str,
     stats: Arc<PipelineStats>,
-    mut console_writer: Option<Box<dyn Write + Send>>,
+    reporter: ReporterHandle,
 ) -> Result<()> {
     let sqlite_writer = SqliteWriter::new(&config.db_path, targets, mode).await?;
 
-    let mut console_seen = HashSet::new();
-    let mut batch: Vec<ResultMsg> = Vec::with_capacity(WRITE_BATCH_SIZE);
+    let mut reporter_seen = HashSet::new();
+    let mut export_metas: Vec<ExportMsg> = Vec::new();
+    let mut result_done = false;
+    let mut exports_done = false;
 
-    loop {
-        // If the batch is empty, block until the first message arrives.
-        if batch.is_empty() {
-            match rx.recv().await {
-                Some(msg) => batch.push(msg),
-                None => break, // channel closed, nothing left
-            }
-        }
-
-        // Drain up to WRITE_BATCH_SIZE without blocking
-        while batch.len() < WRITE_BATCH_SIZE {
-            match rx.try_recv() {
-                Ok(msg) => batch.push(msg),
-                Err(_) => break,
-            }
-        }
-
-        // Filter by severity and tee to console
-        let mut db_batch: Vec<ResultMsg> = Vec::with_capacity(batch.len());
-        for msg in batch.drain(..) {
-            if msg.triage < config.min_severity {
-                continue;
-            }
-
-            // Optionally tee to console with in-memory dedup.
-            // Broken pipe or other I/O errors are non-fatal.
-            if let Some(ref mut writer) = console_writer {
-                let key = DeduplicationKey::from_result(&msg);
-                if console_seen.insert(key) {
-                    if let Err(e) = console::write_console(&msg, &mut **writer) {
-                        tracing::warn!("console write error: {e}");
+    while !(result_done && exports_done) {
+        tokio::select! {
+            maybe = rx.recv(), if !result_done => {
+                match maybe {
+                    Some(first) => {
+                        let mut batch: Vec<ResultMsg> = Vec::with_capacity(WRITE_BATCH_SIZE);
+                        batch.push(first);
+                        while batch.len() < WRITE_BATCH_SIZE {
+                            match rx.try_recv() {
+                                Ok(m) => batch.push(m),
+                                Err(_) => break,
+                            }
+                        }
+                        let mut db_batch: Vec<ResultMsg> = Vec::with_capacity(batch.len());
+                        for msg in batch.drain(..) {
+                            if msg.triage < config.min_severity {
+                                continue;
+                            }
+                            let key = DeduplicationKey::from_result(&msg);
+                            if reporter_seen.insert(key) {
+                                reporter.finding(FindingEvent::from_result(&msg));
+                            }
+                            db_batch.push(msg);
+                        }
+                        if !db_batch.is_empty() {
+                            let batch_len = db_batch.len() as u64;
+                            if let Err(e) = sqlite_writer.write_batch(&db_batch).await {
+                                tracing::warn!("failed to write finding batch to SQLite: {e}");
+                            } else {
+                                stats.add_findings_written(batch_len);
+                            }
+                        }
                     }
-                    let _ = writer.flush();
+                    None => result_done = true,
                 }
             }
-
-            db_batch.push(msg);
-        }
-
-        // Batch write to SQLite
-        if !db_batch.is_empty() {
-            let batch_len = db_batch.len() as u64;
-            if let Err(e) = sqlite_writer.write_batch(&db_batch).await {
-                tracing::warn!("failed to write finding batch to SQLite: {e}");
-            } else {
-                stats.add_findings_written(batch_len);
+            maybe = export_meta_rx.recv(), if !exports_done => {
+                match maybe {
+                    Some(em) => export_metas.push(em),
+                    None => exports_done = true,
+                }
             }
         }
     }
 
-    sqlite_writer.finish(&stats).await?;
+    if let Err(e) = sqlite_writer.write_exports(&export_metas).await {
+        tracing::warn!("failed to write exports to SQLite: {e}");
+    }
 
+    sqlite_writer.finish(&stats).await?;
     Ok(())
 }
 
@@ -115,10 +108,9 @@ async fn run_inner(
 mod tests {
     use super::*;
     use crate::classifier::Triage;
+    use crate::tui::ReporterHandle;
     use crate::web::db::FindingsQuery;
     use chrono::Utc;
-    use std::io;
-    use std::io::Cursor;
     use std::sync::Arc;
 
     fn make_msg(triage: Triage, rule: &str, file: &str, context: Option<String>) -> ResultMsg {
@@ -139,10 +131,10 @@ mod tests {
         }
     }
 
-    fn test_config(db_path: std::path::PathBuf, live: bool) -> OutputConfig {
+    fn test_config(db_path: std::path::PathBuf, _live: bool) -> OutputConfig {
         OutputConfig {
             db_path,
-            live,
+            display: crate::tui::DisplayMode::Auto,
             min_severity: Triage::Green,
         }
     }
@@ -159,37 +151,17 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
-
-        let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
-        let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
-        assert_eq!(count, 1, "finding should be in SQLite");
-    }
-
-    #[tokio::test]
-    async fn output_live_tees_to_console() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let config = test_config(tmp.path().to_path_buf(), true);
-        let stats = Arc::new(PipelineStats::default());
-
-        let (tx, rx) = mpsc::channel::<ResultMsg>(10);
-        tx.send(make_msg(Triage::Black, "SSHKey", "id_rsa", None))
-            .await
-            .unwrap();
-        drop(tx);
-
-        let console_buf: Vec<u8> = Vec::new();
-        let console_writer: Box<dyn Write + Send> = Box::new(Cursor::new(console_buf));
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
 
         run_inner(
             rx,
+            em_rx,
             &config,
             &[],
             "scan",
             Arc::clone(&stats),
-            Some(console_writer),
+            ReporterHandle::null(),
         )
         .await
         .unwrap();
@@ -197,31 +169,6 @@ mod tests {
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
         assert_eq!(count, 1, "finding should be in SQLite");
-
-        // Note: We can't easily read the Cursor back after it's been consumed
-        // by the Box<dyn Write>. The DB verification is sufficient — console
-        // output is tested via the console module's own tests.
-    }
-
-    #[tokio::test]
-    async fn output_no_live_no_console() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let config = test_config(tmp.path().to_path_buf(), false);
-        let stats = Arc::new(PipelineStats::default());
-
-        let (tx, rx) = mpsc::channel::<ResultMsg>(10);
-        tx.send(make_msg(Triage::Black, "SSHKey", "id_rsa", None))
-            .await
-            .unwrap();
-        drop(tx);
-
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
-
-        let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
-        let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
-        assert_eq!(count, 1, "finding should be in SQLite even without live");
     }
 
     #[tokio::test]
@@ -256,9 +203,20 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
+
+        run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await
+        .unwrap();
 
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
@@ -272,7 +230,6 @@ mod tests {
         let stats = Arc::new(PipelineStats::default());
 
         let (tx, rx) = mpsc::channel::<ResultMsg>(10);
-        // Same rule + file → duplicate
         tx.send(make_msg(
             Triage::Black,
             "SSHKey",
@@ -291,57 +248,24 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
+
+        run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await
+        .unwrap();
 
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
         assert_eq!(count, 1, "DB UNIQUE constraint should dedup");
-    }
-
-    #[tokio::test]
-    async fn output_dedup_in_console() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let config = test_config(tmp.path().to_path_buf(), true);
-        let stats = Arc::new(PipelineStats::default());
-
-        let (tx, rx) = mpsc::channel::<ResultMsg>(10);
-        tx.send(make_msg(
-            Triage::Black,
-            "SSHKey",
-            "id_rsa",
-            Some("key".into()),
-        ))
-        .await
-        .unwrap();
-        tx.send(make_msg(
-            Triage::Black,
-            "SSHKey",
-            "id_rsa",
-            Some("key".into()),
-        ))
-        .await
-        .unwrap();
-        drop(tx);
-
-        // Use a temp file as the console writer so we can inspect output
-        let console_file = tempfile::NamedTempFile::new().unwrap();
-        let console_path = console_file.path().to_path_buf();
-        let writer: Box<dyn Write + Send> = Box::new(std::io::BufWriter::new(
-            std::fs::File::create(&console_path).unwrap(),
-        ));
-
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), Some(writer))
-            .await
-            .unwrap();
-
-        let contents = std::fs::read_to_string(&console_path).unwrap();
-        assert_eq!(
-            contents.matches("BLACK").count(),
-            1,
-            "console dedup should suppress duplicate: {contents}"
-        );
     }
 
     #[tokio::test]
@@ -353,10 +277,21 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<ResultMsg>(10);
         drop(_tx);
 
-        let result = run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None).await;
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
+
+        let result = run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await;
         assert!(result.is_ok(), "empty channel should return Ok");
 
-        // Scan should still be completed
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let scans = db.list_scans().await.unwrap();
         assert_eq!(scans.len(), 1);
@@ -391,24 +326,24 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
+
+        run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await
+        .unwrap();
 
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
         assert_eq!(count, 3, "all three findings should be in DB");
-    }
-
-    /// A writer that fails on every write — simulates broken pipe.
-    struct FailingWriter;
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
-        }
     }
 
     #[tokio::test]
@@ -430,9 +365,20 @@ mod tests {
         }
         drop(tx);
 
-        run_inner(rx, &config, &[], "scan", Arc::clone(&stats), None)
-            .await
-            .unwrap();
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
+
+        run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await
+        .unwrap();
 
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
@@ -440,11 +386,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_survives_console_write_error() {
-        // Bug 1.4: console write errors must not abort the output loop.
+    async fn output_tees_findings_to_reporter() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let config = test_config(tmp.path().to_path_buf(), true);
+        let config = test_config(tmp.path().to_path_buf(), false);
         let stats = Arc::new(PipelineStats::default());
+        let reporter = ReporterHandle::null();
 
         let (tx, rx) = mpsc::channel::<ResultMsg>(10);
         tx.send(make_msg(Triage::Black, "SSHKey", "id_rsa", None))
@@ -460,22 +406,67 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        // Use a FailingWriter to trigger io::Error on every write
-        let writer: Box<dyn Write + Send> = Box::new(FailingWriter);
+        let (_em_tx, em_rx) = mpsc::channel::<crate::pipeline::ExportMsg>(10);
+        drop(_em_tx);
 
-        let result = run_inner(rx, &config, &[], "scan", Arc::clone(&stats), Some(writer)).await;
+        run_inner(
+            rx,
+            em_rx,
+            &config,
+            &[],
+            "scan",
+            Arc::clone(&stats),
+            reporter.clone(),
+        )
+        .await
+        .unwrap();
 
-        assert!(
-            result.is_ok(),
-            "output should not abort on console write failure: {result:?}"
-        );
+        assert_eq!(reporter.tally_snapshot().total(), 2);
+    }
 
-        // Both findings should still be in SQLite despite console errors
+    #[tokio::test]
+    async fn output_persists_exports() {
+        use crate::nfs::{ExportAccessOptions, Misconfiguration, NfsVersion};
+        use crate::pipeline::ExportMsg;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let config = test_config(tmp.path().to_path_buf(), false);
+        let stats = Arc::new(PipelineStats::default());
+
+        let (res_tx, res_rx) = mpsc::channel::<ResultMsg>(10);
+        drop(res_tx);
+        let (em_tx, em_rx) = mpsc::channel::<ExportMsg>(10);
+        em_tx
+            .send(ExportMsg {
+                host: "10.0.0.9".into(),
+                export_path: "/srv/backups".into(),
+                nfs_version: NfsVersion::V3,
+                access_options: ExportAccessOptions {
+                    allowed_hosts: vec![],
+                },
+                harvested_uids: vec![],
+                misconfigs: vec![Misconfiguration::SubtreeBypass],
+            })
+            .await
+            .unwrap();
+        drop(em_tx);
+
+        run_inner(
+            res_rx,
+            em_rx,
+            &config,
+            &[],
+            "recon",
+            Arc::clone(&stats),
+            ReporterHandle::null(),
+        )
+        .await
+        .unwrap();
+
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
-        let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
-        assert_eq!(
-            count, 2,
-            "both findings should be in DB even when console write fails"
-        );
+        let recs = db.export_records(None, "10.0.0.9").await.unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].export_path, "/srv/backups");
+        assert_eq!(recs[0].misconfigs, vec!["subtree".to_string()]);
     }
 }

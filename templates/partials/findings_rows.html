@@ -1,8 +1,9 @@
 {% if findings.is_empty() %}
-<tr><td colspan="10" class="empty-state">No findings match your filters</td></tr>
+<tr><td colspan="11" class="empty-state">No findings match your filters</td></tr>
 {% else %}
 {% for f in findings %}
 <tr class="findings-row" data-severity="{{ f.triage|lower }}">
+    <td><input type="checkbox" class="row-select" value="{{ f.id }}" onchange="onRowSelectChange()"></td>
     <td><button class="expand-toggle" onclick="toggleDetail(this,{{ f.id }})">&#9656;</button></td>
     <td><span class="badge badge-{{ f.triage|lower }}">{{ f.triage }}</span></td>
     <td>{{ f.rule_name }}</td>
@@ -19,26 +20,12 @@
             hx-post="/api/findings/{{ f.id }}/review" hx-swap="outerHTML">{% if f.reviewed %}&#9745;{% else %}&#9744;{% endif %}</button>
     </td>
 </tr>
-<tr class="detail-row" style="display:none"><td colspan="10"></td></tr>
+<tr class="detail-row" style="display:none"><td colspan="11"></td></tr>
 {% endfor %}
 {% endif %}
-<div id="findings-pagination" hx-swap-oob="true" class="pagination">
-    <span class="pagination-info">Showing {{ showing_start }}&ndash;{{ showing_end }} of {{ total }}</span>
-    {% if page > 1 %}
-    <button class="pagination-btn"
-        hx-get="/api/findings?page={{ page - 1 }}&amp;per_page={{ per_page }}&amp;triage={{ current_triage }}&amp;host={{ current_host }}&amp;rule={{ current_rule }}&amp;q={{ current_q }}&amp;sort={{ current_sort }}&amp;dir={{ current_dir }}&amp;show={{ current_show }}"
-        hx-target="#findings-tbody" hx-swap="innerHTML">&larr; Prev</button>
-    {% else %}
-    <button class="pagination-btn" disabled>&larr; Prev</button>
-    {% endif %}
-    {% if page < total_pages %}
-    <button class="pagination-btn"
-        hx-get="/api/findings?page={{ page + 1 }}&amp;per_page={{ per_page }}&amp;triage={{ current_triage }}&amp;host={{ current_host }}&amp;rule={{ current_rule }}&amp;q={{ current_q }}&amp;sort={{ current_sort }}&amp;dir={{ current_dir }}&amp;show={{ current_show }}"
-        hx-target="#findings-tbody" hx-swap="innerHTML">Next &rarr;</button>
-    {% else %}
-    <button class="pagination-btn" disabled>Next &rarr;</button>
-    {% endif %}
-</div>
+{% if is_fragment %}
+<div id="findings-pagination" hx-swap-oob="true" class="pagination">{% include "partials/_pagination.html" %}</div>
+{% endif %}
 {% if is_fragment %}
 <select id="host-select" name="host" class="filter-select"
     hx-get="/api/findings" hx-trigger="change" hx-target="#findings-tbody"

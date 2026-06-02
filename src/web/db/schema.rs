@@ -52,6 +52,28 @@ CREATE INDEX IF NOT EXISTS idx_findings_host        ON findings(host);
 CREATE INDEX IF NOT EXISTS idx_findings_rule        ON findings(rule_name);
 CREATE INDEX IF NOT EXISTS idx_findings_host_export ON findings(host, export_path);
 
+CREATE TABLE IF NOT EXISTS exports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id      INTEGER NOT NULL REFERENCES scans(id),
+    host         TEXT NOT NULL,
+    export_path  TEXT NOT NULL,
+    nfs_version  TEXT NOT NULL,
+    allowed_hosts TEXT,
+    UNIQUE(scan_id, host, export_path)
+);
+
+CREATE TABLE IF NOT EXISTS misconfigs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id      INTEGER NOT NULL REFERENCES scans(id),
+    host         TEXT NOT NULL,
+    export_path  TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    UNIQUE(scan_id, host, export_path, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exports_scan_host        ON exports(scan_id, host);
+CREATE INDEX IF NOT EXISTS idx_misconfigs_scan_host_exp ON misconfigs(scan_id, host, export_path);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS findings_fts USING fts5(
     file_path, rule_name, matched_pattern, context,
     content='findings', content_rowid='id'
@@ -164,6 +186,8 @@ mod tests {
         assert!(tables.contains(&"scans".to_string()));
         assert!(tables.contains(&"findings".to_string()));
         assert!(tables.contains(&"annotations".to_string()));
+        assert!(tables.contains(&"exports".to_string()));
+        assert!(tables.contains(&"misconfigs".to_string()));
     }
 
     #[tokio::test]

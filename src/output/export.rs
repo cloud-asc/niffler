@@ -82,6 +82,45 @@ pub fn export_tsv(findings: &[Finding], writer: &mut dyn Write) -> io::Result<()
     Ok(())
 }
 
+/// Write findings as a paste-ready Markdown report, grouped by severity
+/// (Black → Red → Yellow → Green). Empty severities are omitted. With no
+/// findings at all, emits the title and a "No findings" line.
+pub fn export_markdown(findings: &[Finding], writer: &mut dyn Write) -> io::Result<()> {
+    writeln!(writer, "# Niffler Findings Report")?;
+    writeln!(writer)?;
+
+    if findings.is_empty() {
+        writeln!(writer, "No findings.")?;
+        return Ok(());
+    }
+
+    for sev in ["Black", "Red", "Yellow", "Green"] {
+        let group: Vec<&Finding> = findings.iter().filter(|f| f.triage == sev).collect();
+        if group.is_empty() {
+            continue;
+        }
+        writeln!(writer, "## {sev} ({})", group.len())?;
+        writeln!(writer)?;
+        for f in group {
+            writeln!(
+                writer,
+                "- **{}**:`{}` — {} — `{}`",
+                f.host,
+                escape_md_code(&f.file_path),
+                f.rule_name,
+                escape_md_code(&f.matched_pattern)
+            )?;
+        }
+        writeln!(writer)?;
+    }
+    Ok(())
+}
+
+/// Replace backticks so a value can sit safely inside a Markdown code span.
+fn escape_md_code(s: &str) -> String {
+    s.replace('`', "'")
+}
+
 /// Escape characters that break TSV line/column boundaries.
 fn escape_tsv(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -312,5 +351,84 @@ mod tests {
             fields[7], "path\\\\to\\\\file",
             "backslashes must be escaped for round-trip safety"
         );
+    }
+
+    #[test]
+    fn test_export_markdown_groups_by_severity() {
+        let findings = sample_findings(); // Black, Red, Green (one each)
+        let mut buf = Vec::new();
+        export_markdown(&findings, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("# Niffler Findings Report"), "has a title");
+        assert!(out.contains("## Black (1)"), "Black section with count");
+        assert!(out.contains("## Red (1)"), "Red section with count");
+        assert!(out.contains("## Green (1)"), "Green section with count");
+        assert!(!out.contains("## Yellow"), "empty severities are omitted");
+        let pb = out.find("## Black").unwrap();
+        let pr = out.find("## Red").unwrap();
+        let pg = out.find("## Green").unwrap();
+        assert!(pb < pr && pr < pg, "sections ordered Black→Red→Green");
+    }
+
+    #[test]
+    fn test_export_markdown_finding_line() {
+        let findings = vec![make_finding(
+            1,
+            "10.0.0.5",
+            "Black",
+            "aws_keys",
+            "/home/.aws/credentials",
+        )];
+        let mut buf = Vec::new();
+        export_markdown(&findings, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("10.0.0.5"), "names the host");
+        assert!(out.contains("/home/.aws/credentials"), "names the path");
+        assert!(out.contains("aws_keys"), "names the rule");
+        assert!(out.contains("test_pattern"), "shows the matched pattern");
+    }
+
+    #[test]
+    fn test_export_markdown_empty() {
+        let findings: Vec<Finding> = vec![];
+        let mut buf = Vec::new();
+        export_markdown(&findings, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("# Niffler Findings Report"),
+            "title still present"
+        );
+        assert!(out.contains("No findings"), "states there are no findings");
+    }
+
+    #[test]
+    fn test_export_markdown_escapes_backtick_in_path() {
+        let mut f = make_finding(1, "10.0.0.1", "Black", "rule", "/tmp/od`d");
+        f.matched_pattern = "se`cret".to_string();
+        let mut buf = Vec::new();
+        export_markdown(&[f], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("od`d"), "backtick in path must be escaped");
+        assert!(
+            !out.contains("se`cret"),
+            "backtick in pattern must be escaped"
+        );
+        assert!(
+            out.contains("od'd") && out.contains("se'cret"),
+            "replaced with single-quote"
+        );
+    }
+
+    #[test]
+    fn finding_deserializes_from_exported_json() {
+        let findings = vec![make_finding(1, "10.0.0.1", "Black", "SSHKey", "/id_rsa")];
+        let mut buf = Vec::new();
+        export_json(&findings, &mut buf).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: crate::web::db::Finding =
+            serde_json::from_str(line.trim()).expect("Finding must deserialize from its own JSON");
+        assert_eq!(parsed.host, "10.0.0.1");
+        assert_eq!(parsed.triage, "Black");
+        assert_eq!(parsed.rule_name, "SSHKey");
     }
 }

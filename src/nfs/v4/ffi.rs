@@ -46,7 +46,7 @@ pub(crate) struct nfs_stat_64 {
     pub nfs_used: u64,
 }
 
-// Bug 6.4: Compile-time size assertion to catch layout mismatches with libnfs headers.
+// Compile-time size assertion to catch layout mismatches with libnfs headers.
 // nfs_stat_64 has 17 u64 fields = 136 bytes minimum. If the struct is smaller than
 // expected, the FFI calls would silently corrupt memory.
 const _: () = {
@@ -55,8 +55,7 @@ const _: () = {
 
 /// Directory entry returned by nfs_readdir (linked list).
 ///
-/// Bug 6.7: Uses `libc::timeval` instead of a custom definition to match system headers.
-/// Bug 6.4: Compile-time size assertion added below.
+/// Uses `libc::timeval` instead of a custom definition to match system headers.
 #[repr(C)]
 pub(crate) struct nfsdirent {
     pub next: *mut Self,
@@ -81,7 +80,7 @@ pub(crate) struct nfsdirent {
     pub ctime_nsec: u32,
 }
 
-// Bug 6.4: Compile-time size assertion for nfsdirent.
+// Compile-time size assertion for nfsdirent.
 // This catches silent memory corruption from layout mismatches with the C definition.
 // On 64-bit platforms: 2 pointers (16) + inode/type_/mode/size (24) + 3 timevals (48) +
 // uid/gid/nlink (12 + padding) + dev/rdev/blksize/blocks/used (40) + 3 nsec fields (12) = ~160.
@@ -128,12 +127,16 @@ unsafe extern "C" {
         flags: c_int,
         nfsfh: *mut *mut nfsfh,
     ) -> c_int;
+    // NOTE: libnfs's sync `nfs_pread` uses the argument order
+    // (nfs, nfsfh, offset, count, buf) — NOT the POSIX pread order. See
+    // /usr/include/nfsc/libnfs.h. Getting this wrong makes libnfs interpret the
+    // buffer pointer as the offset, reading past EOF and returning 0 bytes.
     pub(super) fn nfs_pread(
         nfs: *mut nfs_context,
         nfsfh: *mut nfsfh,
-        buf: *mut c_void,
-        count: usize,
         offset: u64,
+        count: u64,
+        buf: *mut c_void,
     ) -> c_int;
     pub(super) fn nfs_close(nfs: *mut nfs_context, nfsfh: *mut nfsfh) -> c_int;
 
@@ -298,23 +301,5 @@ mod tests {
             NfsError::Transient(msg) => assert_eq!(msg, "some unknown error"),
             other => panic!("expected Transient, got {:?}", other),
         }
-    }
-
-    // Bug 6.4: Compile-time size assertions are tested at build time via const assertions above.
-    // These runtime tests provide additional validation.
-    #[test]
-    fn nfs_stat_64_size_is_sane() {
-        assert!(
-            std::mem::size_of::<nfs_stat_64>() >= 136,
-            "nfs_stat_64 must be at least 136 bytes (17 x u64)"
-        );
-    }
-
-    #[test]
-    fn nfsdirent_size_is_sane() {
-        assert!(
-            std::mem::size_of::<nfsdirent>() >= 150,
-            "nfsdirent must be at least 150 bytes"
-        );
     }
 }

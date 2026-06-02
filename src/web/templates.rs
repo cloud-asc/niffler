@@ -24,6 +24,7 @@ pub struct DashboardTemplate {
     pub pct_green: f64,
     pub top_hosts: Vec<DashboardHost>,
     pub recent_findings: Vec<Finding>,
+    pub latest_scan: Option<Scan>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -75,6 +76,9 @@ pub struct HostExportDetail {
     pub export_path: String,
     pub count: u64,
     pub bar_pct: f64,
+    pub nfs_version: Option<String>,
+    pub allowed_hosts: Option<String>,
+    pub misconfigs: Vec<String>,
     pub findings: Vec<Finding>,
 }
 
@@ -103,6 +107,13 @@ pub struct ScansTemplate {
 pub struct FindingDetailTemplate {
     pub finding: Finding,
     pub permissions: String,
+    pub note: String,
+}
+
+#[derive(Template, WebTemplate)]
+#[template(path = "partials/note_saved.html")]
+pub struct NoteSavedTemplate {
+    pub saved: bool,
 }
 
 #[derive(Template, WebTemplate)]

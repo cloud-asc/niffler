@@ -62,6 +62,14 @@ pub(crate) fn is_dot_entry(name: &str) -> bool {
     name == "." || name == ".."
 }
 
+/// Reject dirent names that would corrupt a path-based NFSv4 file handle.
+///
+/// NFSv4 handles are path strings, so a server-supplied name containing `/`,
+/// a NUL, or `..` could escape the intended directory. Such names are skipped.
+pub(crate) fn is_safe_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
 /// NFSv4 operations on a mounted libnfs context.
 ///
 /// Holds the libnfs context (connection + mount) and the root file handle.
@@ -75,6 +83,7 @@ pub(crate) fn is_dot_entry(name: &str) -> bool {
 pub(crate) struct Nfs4Ops {
     ctx: Arc<std::sync::Mutex<LibnfsContext>>,
     root_fh: NfsFh,
+    max_dir_entries: usize,
 }
 
 // SAFETY: Nfs4Ops wraps LibnfsContext which is Send. All access is through
@@ -83,10 +92,11 @@ unsafe impl Send for Nfs4Ops {}
 
 impl Nfs4Ops {
     /// Create a new `Nfs4Ops` from a mounted context and root handle.
-    pub(super) fn new(ctx: LibnfsContext, root_fh: NfsFh) -> Self {
+    pub(super) fn new(ctx: LibnfsContext, root_fh: NfsFh, max_dir_entries: usize) -> Self {
         Self {
             ctx: Arc::new(std::sync::Mutex::new(ctx)),
             root_fh,
+            max_dir_entries,
         }
     }
 }
@@ -107,7 +117,7 @@ impl Drop for DirHandleGuard {
     }
 }
 
-// Bug 6.6: RAII guards contain raw pointers which are !Send by default.
+// RAII guards contain raw pointers which are !Send by default.
 // SAFETY: Pointers are derived from LibnfsContext which is exclusively owned via &mut self.
 // Guards are created and dropped within a single spawn_blocking closure without crossing
 // thread boundaries — the raw pointers never escape the blocking thread.
@@ -129,7 +139,7 @@ impl Drop for FileHandleGuard {
     }
 }
 
-// Bug 6.6: RAII guards contain raw pointers which are !Send by default.
+// RAII guards contain raw pointers which are !Send by default.
 // SAFETY: Pointers are derived from LibnfsContext which is exclusively owned via &mut self.
 // Guards are created and dropped within a single spawn_blocking closure without crossing
 // thread boundaries — the raw pointers never escape the blocking thread.
@@ -156,6 +166,7 @@ impl NfsOps for Nfs4Ops {
     async fn readdirplus(&mut self, dir: &NfsFh) -> crate::nfs::ops::Result<Vec<DirEntry>> {
         let dir_path = nfsfh_to_path(dir);
         let ctx = Arc::clone(&self.ctx);
+        let max_dir_entries = self.max_dir_entries;
 
         tokio::task::spawn_blocking(move || {
             let mut guard = ctx
@@ -200,10 +211,17 @@ impl NfsOps for Nfs4Ops {
                 if is_dot_entry(&name) {
                     continue;
                 }
+                if !is_safe_entry_name(&name) {
+                    tracing::warn!(
+                        dir = %dir_path,
+                        name = %name,
+                        "skipping NFSv4 dirent with unsafe name"
+                    );
+                    continue;
+                }
 
                 let child_path = format!("{}/{}", dir_path.trim_end_matches('/'), name);
 
-                // Convert dirent mode bits to file type
                 let mode32 = dirent.mode;
                 let file_type = match mode32 & IFMT {
                     m if m == IFREG => NfsFileType::Regular,
@@ -226,9 +244,17 @@ impl NfsOps for Nfs4Ops {
                     fh: path_to_nfsfh(&child_path),
                     attrs,
                 });
+
+                if crate::nfs::ops::dir_entry_cap_reached(entries.len(), max_dir_entries) {
+                    tracing::warn!(
+                        dir = %dir_path,
+                        cap = max_dir_entries,
+                        "directory entry cap reached; truncating listing"
+                    );
+                    break;
+                }
             }
 
-            // Guard drops here, calling nfs_closedir.
             drop(_dir_guard);
 
             Ok(entries)
@@ -302,17 +328,18 @@ impl NfsOps for Nfs4Ops {
 
             let mut buf = vec![0u8; count as usize];
             // SAFETY: ptr and file_handle are valid. buf has count bytes of capacity.
+            // libnfs arg order is (offset, count, buf) — see the nfs_pread FFI note.
             let bytes_read = unsafe {
                 nfs_pread(
                     ptr,
                     file_handle,
-                    buf.as_mut_ptr() as *mut c_void,
-                    count as usize,
                     offset,
+                    u64::from(count),
+                    buf.as_mut_ptr() as *mut c_void,
                 )
             };
 
-            // Bug 6.5: Capture the error message BEFORE dropping the guard.
+            // Capture the error message BEFORE dropping the guard.
             // nfs_close (called by the guard's drop) may overwrite the libnfs
             // internal error buffer, losing the actual error from nfs_pread.
             let err_msg = if bytes_read < 0 {
@@ -393,7 +420,7 @@ impl NfsOps for Nfs4Ops {
                     as Box<dyn std::error::Error + Send + Sync>);
             }
 
-            // Bug 6.3: nfs_readlink2 returns a pointer to an internal libnfs buffer.
+            // nfs_readlink2 returns a pointer to an internal libnfs buffer.
             // The buffer is managed by libnfs and will be freed/reused on the next
             // operation. We copy it immediately to a Rust String. Do NOT call
             // libc::free() — the pointer is not heap-allocated by malloc; it points
@@ -422,6 +449,23 @@ mod tests {
     use super::*;
     use crate::nfs::auth::AuthCreds;
     use crate::nfs::connector::NfsConnector;
+
+    #[test]
+    fn safe_entry_name_accepts_normal_names() {
+        assert!(is_safe_entry_name("file.txt"));
+        assert!(is_safe_entry_name(".env"));
+        assert!(is_safe_entry_name("..hidden"));
+    }
+
+    #[test]
+    fn safe_entry_name_rejects_path_corrupting_names() {
+        assert!(!is_safe_entry_name(""));
+        assert!(!is_safe_entry_name("."));
+        assert!(!is_safe_entry_name(".."));
+        assert!(!is_safe_entry_name("a/b"));
+        assert!(!is_safe_entry_name("../etc"));
+        assert!(!is_safe_entry_name("bad\0name"));
+    }
 
     #[test]
     fn path_to_nfsfh_stores_bytes() {

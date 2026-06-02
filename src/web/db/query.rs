@@ -5,7 +5,8 @@ use rusqlite::OptionalExtension;
 use rusqlite::params;
 
 use super::{
-    Database, ExportCount, Finding, FindingsQuery, HostCount, Scan, ScanStats, ShowFilter,
+    Database, ExportCount, ExportRecord, Finding, FindingsQuery, HostCount, Scan, ScanStats,
+    ShowFilter, TopologyExport,
 };
 
 pub(super) const FINDING_SELECT: &str = "SELECT f.id, f.scan_id, f.timestamp, f.host, f.export_path, \
@@ -51,6 +52,17 @@ fn triage_to_int(t: &str) -> i64 {
         "Red" => 2,
         "Yellow" => 1,
         _ => 0, // Green and anything unknown
+    }
+}
+
+/// The `annotations` table is only referenced by the star/review `show` filters.
+/// For every other query the LEFT JOIN is dead weight, so include it only when needed.
+fn annotations_join(show: ShowFilter) -> &'static str {
+    match show {
+        ShowFilter::All => "",
+        ShowFilter::Starred | ShowFilter::Unreviewed => {
+            "LEFT JOIN annotations a ON a.finding_id = f.id "
+        }
     }
 }
 
@@ -195,16 +207,22 @@ impl Database {
                 match scan_id {
                     Some(id) => {
                         let mut stmt = conn.prepare(
-                            "SELECT host, COUNT(*) as cnt FROM findings WHERE scan_id = ?1 \
-                             GROUP BY host ORDER BY cnt DESC",
+                            "SELECT host, SUM(cnt) AS cnt FROM (
+                                 SELECT host, COUNT(*) AS cnt FROM findings WHERE scan_id = ?1 GROUP BY host
+                                 UNION ALL
+                                 SELECT host, 0 AS cnt FROM (SELECT DISTINCT host FROM exports WHERE scan_id = ?1)
+                             ) GROUP BY host ORDER BY cnt DESC, host",
                         )?;
                         let rows = stmt.query_map(params![id], row_mapper)?;
                         Ok::<_, rusqlite::Error>(rows.filter_map(Result::ok).collect())
                     }
                     None => {
                         let mut stmt = conn.prepare(
-                            "SELECT host, COUNT(*) as cnt FROM findings \
-                             GROUP BY host ORDER BY cnt DESC",
+                            "SELECT host, SUM(cnt) AS cnt FROM (
+                                 SELECT host, COUNT(*) AS cnt FROM findings GROUP BY host
+                                 UNION ALL
+                                 SELECT host, 0 AS cnt FROM (SELECT DISTINCT host FROM exports)
+                             ) GROUP BY host ORDER BY cnt DESC, host",
                         )?;
                         let rows = stmt.query_map([], row_mapper)?;
                         Ok::<_, rusqlite::Error>(rows.filter_map(Result::ok).collect())
@@ -373,10 +391,9 @@ impl Database {
             .call(move |conn| {
                 let (where_clause, params) =
                     build_findings_where(scan_id, &triage, &min_triage, &host, &rule, &q, show);
+                let join = annotations_join(show);
                 let sql = format!(
-                    "SELECT DISTINCT f.host FROM findings f \
-                     LEFT JOIN annotations a ON a.finding_id = f.id \
-                     {where_clause} ORDER BY f.host"
+                    "SELECT DISTINCT f.host FROM findings f {join}{where_clause} ORDER BY f.host"
                 );
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(AsRef::as_ref).collect();
@@ -401,10 +418,10 @@ impl Database {
             .call(move |conn| {
                 let (where_clause, params) =
                     build_findings_where(scan_id, &triage, &min_triage, &host, &rule, &q, show);
+                let join = annotations_join(show);
                 let sql = format!(
-                    "SELECT DISTINCT f.rule_name FROM findings f \
-                     LEFT JOIN annotations a ON a.finding_id = f.id \
-                     {where_clause} ORDER BY f.rule_name"
+                    "SELECT DISTINCT f.rule_name FROM findings f {join}{where_clause} \
+                     ORDER BY f.rule_name"
                 );
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(AsRef::as_ref).collect();
@@ -465,11 +482,8 @@ impl Database {
             .call(move |conn| {
                 let (where_clause, params) =
                     build_findings_where(scan_id, &triage, &min_triage, &host, &rule, &q, show);
-                let sql = format!(
-                    "SELECT COUNT(*) FROM findings f \
-                     LEFT JOIN annotations a ON a.finding_id = f.id \
-                     {where_clause}"
-                );
+                let join = annotations_join(show);
+                let sql = format!("SELECT COUNT(*) FROM findings f {join}{where_clause}");
                 let refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(AsRef::as_ref).collect();
                 conn.query_row(&sql, refs.as_slice(), |row| row.get(0))
@@ -512,6 +526,124 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Persisted exports for a host (from the `exports` table), each with its
+    /// misconfig kinds joined from `misconfigs`. Scoped to `scan_id` when given.
+    pub async fn export_records(
+        &self,
+        scan_id: Option<i64>,
+        host: &str,
+    ) -> Result<Vec<ExportRecord>> {
+        let host = host.to_string();
+        self.conn
+            .call(move |conn| {
+                let (sql, bind_scan): (String, bool) = match scan_id {
+                    Some(_) => (
+                        "SELECT export_path, nfs_version, allowed_hosts FROM exports \
+                         WHERE host = ?1 AND scan_id = ?2 ORDER BY export_path"
+                            .into(),
+                        true,
+                    ),
+                    None => (
+                        "SELECT export_path, nfs_version, allowed_hosts FROM exports \
+                         WHERE host = ?1 ORDER BY export_path"
+                            .into(),
+                        false,
+                    ),
+                };
+                let mut stmt = conn.prepare(&sql)?;
+                let misconfig_sql = match scan_id {
+                    Some(_) => {
+                        "SELECT kind FROM misconfigs WHERE host = ?1 AND export_path = ?2 \
+                                AND scan_id = ?3 ORDER BY kind"
+                    }
+                    None => {
+                        "SELECT kind FROM misconfigs WHERE host = ?1 AND export_path = ?2 \
+                             ORDER BY kind"
+                    }
+                };
+                let mut mstmt = conn.prepare(misconfig_sql)?;
+                let rows: Vec<(String, String, Option<String>)> = if bind_scan {
+                    stmt.query_map(rusqlite::params![host, scan_id.unwrap()], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .filter_map(std::result::Result::ok)
+                    .collect()
+                } else {
+                    stmt.query_map(rusqlite::params![host], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?
+                    .filter_map(std::result::Result::ok)
+                    .collect()
+                };
+                let mut out: Vec<ExportRecord> = Vec::new();
+                for (export_path, nfs_version, allowed_hosts) in rows {
+                    let kinds: Vec<String> = match scan_id {
+                        Some(id) => mstmt
+                            .query_map(rusqlite::params![host, export_path, id], |r| {
+                                r.get::<_, String>(0)
+                            })?
+                            .filter_map(std::result::Result::ok)
+                            .collect(),
+                        None => mstmt
+                            .query_map(rusqlite::params![host, export_path], |r| {
+                                r.get::<_, String>(0)
+                            })?
+                            .filter_map(std::result::Result::ok)
+                            .collect(),
+                    };
+                    out.push(ExportRecord {
+                        host: host.clone(),
+                        export_path,
+                        nfs_version,
+                        allowed_hosts,
+                        misconfigs: kinds,
+                    });
+                }
+                Ok::<_, rusqlite::Error>(out)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Topology rows for a host: every persisted export plus any
+    /// findings-only export paths, each with finding count and misconfigs.
+    pub async fn host_topology(
+        &self,
+        scan_id: Option<i64>,
+        host: &str,
+    ) -> Result<Vec<TopologyExport>> {
+        use std::collections::BTreeMap;
+        let persisted = self.export_records(scan_id, host).await?;
+        let counts = self.host_exports(scan_id, host).await?;
+
+        let mut by_path: BTreeMap<String, TopologyExport> = BTreeMap::new();
+        for e in persisted {
+            by_path.insert(
+                e.export_path.clone(),
+                TopologyExport {
+                    export_path: e.export_path,
+                    nfs_version: Some(e.nfs_version),
+                    allowed_hosts: e.allowed_hosts,
+                    misconfigs: e.misconfigs,
+                    finding_count: 0,
+                },
+            );
+        }
+        for c in counts {
+            by_path
+                .entry(c.export_path.clone())
+                .and_modify(|t| t.finding_count = c.count)
+                .or_insert(TopologyExport {
+                    export_path: c.export_path,
+                    nfs_version: None,
+                    allowed_hosts: None,
+                    misconfigs: Vec::new(),
+                    finding_count: c.count,
+                });
+        }
+        Ok(by_path.into_values().collect())
+    }
+
     pub async fn findings_for_host_export(
         &self,
         scan_id: Option<i64>,
@@ -544,6 +676,27 @@ impl Database {
                     let rows = stmt.query_map(params![host, export], row_to_finding)?;
                     Ok::<_, rusqlite::Error>(rows.filter_map(Result::ok).collect())
                 }
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Fetch specific findings by id (for "export selected"). Empty input
+    /// returns an empty Vec without querying.
+    pub async fn list_findings_by_ids(&self, ids: &[i64]) -> Result<Vec<Finding>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = ids.to_vec();
+        self.conn
+            .call(move |conn| {
+                let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!("{FINDING_SELECT} WHERE f.id IN ({placeholders})");
+                let mut stmt = conn.prepare(&sql)?;
+                let params = rusqlite::params_from_iter(ids.iter());
+                let rows = stmt.query_map(params, row_to_finding)?;
+                let out: Vec<Finding> = rows.filter_map(std::result::Result::ok).collect();
+                Ok::<_, rusqlite::Error>(out)
             })
             .await
             .map_err(Into::into)
@@ -936,6 +1089,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_count_findings_respects_show_starred() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = seed_test_data(&db).await;
+
+        let all = db
+            .count_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all, 10);
+
+        let one = db
+            .list_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                per_page: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.toggle_star(one[0].id).await.unwrap();
+
+        let starred = db
+            .count_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                show: crate::web::db::ShowFilter::Starred,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(starred, 1, "only the starred finding should be counted");
+    }
+
+    #[tokio::test]
     async fn test_findings_filter_min_triage_red() {
         let db = Database::open_memory().await.unwrap();
         let scan_id = seed_test_data(&db).await;
@@ -1008,5 +1196,159 @@ mod tests {
         };
         let results = db.list_findings(&query).await.unwrap();
         assert_eq!(results.len(), 10, "min_triage=None should return all");
+    }
+
+    #[tokio::test]
+    async fn test_export_records_roundtrip_via_raw_insert() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = db.create_scan(&["10.0.0.1".into()], "recon").await.unwrap();
+        db.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO exports (scan_id, host, export_path, nfs_version, allowed_hosts)
+                     VALUES (?1, '10.0.0.1', '/exports/home', 'v3', '*')",
+                    rusqlite::params![scan_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO misconfigs (scan_id, host, export_path, kind)
+                     VALUES (?1, '10.0.0.1', '/exports/home', 'possible_no_root_squash')",
+                    rusqlite::params![scan_id],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let recs = db.export_records(Some(scan_id), "10.0.0.1").await.unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].export_path, "/exports/home");
+        assert_eq!(recs[0].nfs_version, "v3");
+        assert_eq!(recs[0].allowed_hosts.as_deref(), Some("*"));
+        assert_eq!(
+            recs[0].misconfigs,
+            vec!["possible_no_root_squash".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_topology_merges_persisted_and_findings() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = seed_test_data(&db).await;
+        db.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO exports (scan_id, host, export_path, nfs_version, allowed_hosts)
+                     VALUES (?1, '10.0.0.1', '/exports/empty', 'v3', '10.0.0.0/24')",
+                    rusqlite::params![scan_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO misconfigs (scan_id, host, export_path, kind)
+                     VALUES (?1, '10.0.0.1', '/exports/empty', 'insecure')",
+                    rusqlite::params![scan_id],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let topo = db.host_topology(None, "10.0.0.1").await.unwrap();
+        let empty = topo
+            .iter()
+            .find(|t| t.export_path == "/exports/empty")
+            .unwrap();
+        assert_eq!(empty.finding_count, 0);
+        assert_eq!(empty.nfs_version.as_deref(), Some("v3"));
+        assert_eq!(empty.misconfigs, vec!["insecure".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_list_hosts_includes_export_only_hosts() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = db
+            .create_scan(&["10.0.0.0/24".into()], "recon")
+            .await
+            .unwrap();
+        db.conn
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO exports (scan_id, host, export_path, nfs_version, allowed_hosts)
+                     VALUES (?1, '10.9.9.9', '/only', 'v4', NULL)",
+                    rusqlite::params![scan_id],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let hosts = db.list_hosts(None).await.unwrap();
+        assert!(
+            hosts.iter().any(|h| h.host == "10.9.9.9"),
+            "export-only host must appear in the hosts list"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_findings_by_ids() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = seed_test_data(&db).await;
+        let all = db
+            .list_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                per_page: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let want: Vec<i64> = all.iter().take(3).map(|f| f.id).collect();
+
+        let got = db.list_findings_by_ids(&want).await.unwrap();
+        assert_eq!(got.len(), 3);
+        let got_ids: std::collections::HashSet<i64> = got.iter().map(|f| f.id).collect();
+        for id in &want {
+            assert!(got_ids.contains(id), "id {id} should be returned");
+        }
+
+        assert!(db.list_findings_by_ids(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_export_records_misconfigs_are_scan_scoped() {
+        let db = Database::open_memory().await.unwrap();
+        let scan1 = db.create_scan(&["10.0.0.1".into()], "recon").await.unwrap();
+        let scan2 = db.create_scan(&["10.0.0.1".into()], "recon").await.unwrap();
+        // Same host+export in two scans, with DIFFERENT misconfigs.
+        db.conn
+            .call(move |conn| {
+                for (sid, kind) in [(scan1, "insecure"), (scan2, "subtree")] {
+                    conn.execute(
+                        "INSERT INTO exports (scan_id, host, export_path, nfs_version, allowed_hosts)
+                         VALUES (?1, '10.0.0.1', '/x', 'v3', NULL)",
+                        rusqlite::params![sid],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO misconfigs (scan_id, host, export_path, kind)
+                         VALUES (?1, '10.0.0.1', '/x', ?2)",
+                        rusqlite::params![sid, kind],
+                    )?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let recs1 = db.export_records(Some(scan1), "10.0.0.1").await.unwrap();
+        assert_eq!(recs1.len(), 1);
+        assert_eq!(
+            recs1[0].misconfigs,
+            vec!["insecure".to_string()],
+            "scan1 sees only its own misconfig"
+        );
+
+        let recs2 = db.export_records(Some(scan2), "10.0.0.1").await.unwrap();
+        assert_eq!(
+            recs2[0].misconfigs,
+            vec!["subtree".to_string()],
+            "scan2 sees only its own misconfig"
+        );
     }
 }

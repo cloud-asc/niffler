@@ -1,9 +1,4 @@
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use bytesize::ByteSize;
-
-use crate::classifier::Triage;
 
 /// Thread-safe pipeline statistics with atomic counters.
 /// Shared across pipeline phases via `Arc<PipelineStats>`.
@@ -158,61 +153,6 @@ impl PipelineStats {
     }
 }
 
-/// Formats pipeline stats with severity-aware labels.
-///
-/// Progress bars show "Matches (all)" for total rule hits and
-/// "Findings (>= {severity})" for the count that passed the
-/// severity filter. This wrapper carries the `min_severity` from
-/// config so `Display` can render the correct threshold.
-pub struct StatsFormatter<'a> {
-    pub stats: &'a PipelineStats,
-    pub min_severity: Triage,
-}
-
-impl fmt::Display for StatsFormatter<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = self.stats;
-        let sev = self.min_severity;
-
-        let hosts = s.hosts_scanned.load(Ordering::Relaxed);
-        let exports = s.exports_found.load(Ordering::Relaxed);
-        let exports_fail = s.exports_failed.load(Ordering::Relaxed);
-        let exports_deny = s.exports_denied.load(Ordering::Relaxed);
-        let dirs = s.dirs_walked.load(Ordering::Relaxed);
-        let files_discovered = s.files_discovered.load(Ordering::Relaxed);
-        let files_scanned = s.files_content_scanned.load(Ordering::Relaxed);
-        let skip_perm = s.files_skipped_permission.load(Ordering::Relaxed);
-        let skip_size = s.files_skipped_size.load(Ordering::Relaxed);
-        let skip_binary = s.files_skipped_binary.load(Ordering::Relaxed);
-        let findings = s.findings.load(Ordering::Relaxed);
-        let findings_written = s.findings_written.load(Ordering::Relaxed);
-        let err_transient = s.errors_transient.load(Ordering::Relaxed);
-        let err_stale = s.errors_stale.load(Ordering::Relaxed);
-        let err_conn = s.errors_connection.load(Ordering::Relaxed);
-        let scan_retries = s.scanner_retries.load(Ordering::Relaxed);
-        let bytes = s.bytes_read.load(Ordering::Relaxed);
-
-        writeln!(f, "Scan Summary:")?;
-        writeln!(f, "  Hosts scanned:              {hosts:>6}")?;
-        writeln!(f, "  Exports found:              {exports:>6}")?;
-        writeln!(f, "  Exports failed (fatal):     {exports_fail:>6}")?;
-        writeln!(f, "  Exports denied (permission):{exports_deny:>6}")?;
-        writeln!(f, "  Directories walked:         {dirs:>6}")?;
-        writeln!(f, "  Files discovered:           {files_discovered:>6}")?;
-        writeln!(f, "  Files content scanned:      {files_scanned:>6}")?;
-        writeln!(f, "  Files skipped (permission): {skip_perm:>6}")?;
-        writeln!(f, "  Files skipped (size):       {skip_size:>6}")?;
-        writeln!(f, "  Files skipped (binary):     {skip_binary:>6}")?;
-        writeln!(f, "  Matches (all):              {findings:>6}")?;
-        writeln!(f, "  Findings (>= {sev}):{findings_written:>6}")?;
-        writeln!(f, "  Errors (transient):         {err_transient:>6}")?;
-        writeln!(f, "  Errors (stale handle):      {err_stale:>6}")?;
-        writeln!(f, "  Errors (connection):        {err_conn:>6}")?;
-        writeln!(f, "  Scanner retries:            {scan_retries:>6}")?;
-        write!(f, "  Bytes read:            {}", ByteSize::b(bytes))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,35 +225,5 @@ mod tests {
         assert_eq!(snap.exports_found.load(Ordering::Relaxed), 0);
         assert_eq!(snap.exports_failed.load(Ordering::Relaxed), 1);
         assert_eq!(snap.exports_denied.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn stats_formatter_uses_severity_label() {
-        use crate::classifier::Triage;
-
-        let stats = PipelineStats::default();
-        stats.inc_findings();
-        stats.inc_findings();
-        stats.add_findings_written(1);
-
-        let fmt = StatsFormatter {
-            stats: &stats,
-            min_severity: Triage::Red,
-        };
-        let output = format!("{fmt}");
-
-        assert!(
-            output.contains("Matches (all):"),
-            "should say 'Matches (all)': {output}"
-        );
-        assert!(
-            output.contains("Findings (>= Red):"),
-            "should say 'Findings (>= Red)': {output}"
-        );
-        // Must NOT contain old labels
-        assert!(
-            !output.contains("Findings written"),
-            "old label should be gone: {output}"
-        );
     }
 }

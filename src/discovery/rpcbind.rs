@@ -32,14 +32,20 @@ pub async fn query_rpc_services(
 
     let mut nfs_versions = Vec::new();
 
-    if pm.getport(100_003, 3).await.is_ok() {
+    // portmapper GETPORT returns port 0 (a successful reply, not an error) for an
+    // unregistered program/version, so `.is_ok()` alone is not enough — a service
+    // is present only when the returned port is non-zero. A v4-only Linux server
+    // registers NFS (100003 v4) but not mountd v3, so getport(100005,3) replies
+    // with port 0; treating that as "MOUNT available" wrongly routes the host to
+    // the v3 MOUNT path (which then fails) instead of v4 pseudo-root discovery.
+    if matches!(pm.getport(100_003, 3).await, Ok(port) if port != 0) {
         nfs_versions.push(3);
     }
-    if pm.getport(100_003, 4).await.is_ok() {
+    if matches!(pm.getport(100_003, 4).await, Ok(port) if port != 0) {
         nfs_versions.push(4);
     }
 
-    let mount_available = pm.getport(100_005, 3).await.is_ok();
+    let mount_available = matches!(pm.getport(100_005, 3).await, Ok(port) if port != 0);
 
     Ok(RpcServices {
         nfs_versions,

@@ -5,5 +5,6 @@ pub mod nfs;
 pub mod output;
 pub mod pipeline;
 pub mod scanner;
+pub mod tui;
 pub mod walker;
 pub mod web;

@@ -20,6 +20,24 @@ function setSort(column) {
         si.value = column;
         di.value = 'desc';
     }
+    updateSortIndicators();
+}
+// The findings sort swaps only #findings-tbody, leaving the <thead> untouched.
+// Mirror the active column/direction here so the arrow tracks clicks too.
+function updateSortIndicators() {
+    var col = document.getElementById('sort-input').value;
+    var dir = document.getElementById('dir-input').value;
+    document.querySelectorAll('th.sortable').forEach(function(th) {
+        var ind = th.querySelector('.sort-indicator');
+        if (!ind) return;
+        if (th.dataset.col === col) {
+            ind.classList.add('active');
+            ind.innerHTML = dir === 'asc' ? '↑' : '↓';
+        } else {
+            ind.classList.remove('active');
+            ind.innerHTML = '';
+        }
+    });
 }
 function clearFilters() {
     document.querySelector('select[name="triage"]').value = '';
@@ -28,6 +46,7 @@ function clearFilters() {
     document.querySelector('input[name="q"]').value = '';
     document.getElementById('sort-input').value = 'timestamp';
     document.getElementById('dir-input').value = 'desc';
+    updateSortIndicators();
     setShow(document.querySelector('.show-toggle-btn'), 'all');
 }
 </script>
@@ -55,7 +74,10 @@ function clearFilters() {
         {% endfor %}
     </select>
 
-    <input name="q" type="search" class="filter-input" placeholder="Search findings..."
+    <input name="q" type="search" class="filter-input"
+        placeholder="Search content, path, rule, or pattern…"
+        title="Full-text search across the file content snippet, file path, rule name, and matched pattern"
+        aria-label="Search findings full-text"
         value="{{ current_q }}"
         hx-get="/api/findings" hx-trigger="input changed delay:300ms, search"
         hx-target="#findings-tbody" hx-swap="innerHTML" hx-include="#findings-form">
@@ -80,46 +102,77 @@ function clearFilters() {
        onclick="event.preventDefault(); var p = new URLSearchParams(new FormData(document.getElementById('findings-form'))); window.location = '/api/export/csv?' + p.toString();">Export CSV</a>
     <a href="/api/export/json" class="export-btn"
        onclick="event.preventDefault(); var p = new URLSearchParams(new FormData(document.getElementById('findings-form'))); window.location = '/api/export/json?' + p.toString();">Export JSON</a>
+    <a href="/api/export/markdown" class="export-btn"
+       onclick="event.preventDefault(); var p = new URLSearchParams(new FormData(document.getElementById('findings-form'))); window.location = '/api/export/markdown?' + p.toString();">Export MD</a>
     <button type="button" class="clear-btn" onclick="clearFilters()"
         hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
         hx-include="#findings-form">Clear</button>
 </form>
 
+<div id="bulk-bar" class="bulk-bar" style="display:none">
+    <span class="bulk-count"><span id="bulk-count-n">0</span> selected</span>
+    <button type="button" class="bulk-btn"
+        hx-post="/api/findings/bulk" hx-target="#findings-tbody" hx-swap="innerHTML"
+        hx-include="#findings-form, #bulk-ids" hx-vals='{"action":"review"}'>Mark reviewed</button>
+    <button type="button" class="bulk-btn"
+        hx-post="/api/findings/bulk" hx-target="#findings-tbody" hx-swap="innerHTML"
+        hx-include="#findings-form, #bulk-ids" hx-vals='{"action":"star"}'>Star</button>
+    <select id="bulk-triage-select" class="filter-select" aria-label="Set triage">
+        <option value="">Set triage…</option>
+        <option value="Black">Black</option>
+        <option value="Red">Red</option>
+        <option value="Yellow">Yellow</option>
+        <option value="Green">Green</option>
+    </select>
+    <button type="button" class="bulk-btn"
+        hx-post="/api/findings/bulk" hx-target="#findings-tbody" hx-swap="innerHTML"
+        hx-include="#findings-form, #bulk-ids"
+        hx-vals='js:{action: "triage", bulk_triage: document.getElementById("bulk-triage-select").value}'>Apply</button>
+    <span class="bulk-export">Export:
+        <button type="button" class="bulk-btn" onclick="exportSelected('csv')">CSV</button>
+        <button type="button" class="bulk-btn" onclick="exportSelected('json')">JSON</button>
+        <button type="button" class="bulk-btn" onclick="exportSelected('markdown')">MD</button>
+    </span>
+    <span class="bulk-hint">j/k move · x select · e expand · s star · u reviewed</span>
+</div>
+<input type="hidden" id="bulk-ids" name="ids" value="">
+<div class="table-scroll">
 <table class="data-table">
     <thead>
         <tr>
+            <th style="width:2rem"><input type="checkbox" id="select-all" onchange="onSelectAllChange(this)" title="Select all on this page" aria-label="Select all findings on this page"></th>
             <th style="width:2rem"></th>
-            <th class="sortable"
+            <th class="sortable" data-col="triage"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('triage')">
-                Severity {% if current_sort == "triage" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Severity <span class="sort-indicator{% if current_sort == "triage" %} active{% endif %}">{% if current_sort == "triage" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
-            <th class="sortable"
+            <th class="sortable" data-col="rule_name"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('rule_name')">
-                Rule {% if current_sort == "rule_name" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Rule <span class="sort-indicator{% if current_sort == "rule_name" %} active{% endif %}">{% if current_sort == "rule_name" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
             <th>Pattern</th>
-            <th class="sortable"
+            <th class="sortable" data-col="host"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('host')">
-                Host {% if current_sort == "host" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Host <span class="sort-indicator{% if current_sort == "host" %} active{% endif %}">{% if current_sort == "host" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
-            <th class="sortable"
+            <th class="sortable" data-col="file_path"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('file_path')">
-                Path {% if current_sort == "file_path" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Path <span class="sort-indicator{% if current_sort == "file_path" %} active{% endif %}">{% if current_sort == "file_path" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
             <th>Context</th>
-            <th class="sortable"
+            <th class="sortable" data-col="file_size"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('file_size')">
-                Size {% if current_sort == "file_size" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Size <span class="sort-indicator{% if current_sort == "file_size" %} active{% endif %}">{% if current_sort == "file_size" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
-            <th class="sortable"
+            <th class="sortable" data-col="timestamp"
                 hx-get="/api/findings" hx-target="#findings-tbody" hx-swap="innerHTML"
                 hx-include="#findings-form" onclick="setSort('timestamp')">
-                Date {% if current_sort == "timestamp" %}<span class="sort-indicator active">{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}</span>{% endif %}
+                Date <span class="sort-indicator{% if current_sort == "timestamp" %} active{% endif %}">{% if current_sort == "timestamp" %}{% if current_dir == "asc" %}&uarr;{% else %}&darr;{% endif %}{% endif %}</span>
             </th>
             <th style="width:4rem">Actions</th>
         </tr>
@@ -128,6 +181,7 @@ function clearFilters() {
         {% include "partials/findings_rows.html" %}
     </tbody>
 </table>
+</div>
 
-<div id="findings-pagination" class="pagination"></div>
+<div id="findings-pagination" class="pagination">{% include "partials/_pagination.html" %}</div>
 {% endblock %}

@@ -3,29 +3,29 @@
 [![CI](https://github.com/dejisec/niffler/actions/workflows/ci.yml/badge.svg)](https://github.com/dejisec/niffler/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/dejisec/niffler)](https://github.com/dejisec/niffler/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 
 Niffler scans NFS servers for credentials, secrets, and misconfigurations. Think [Snaffler](https://github.com/SnaffCon/Snaffler), but for NFS instead of SMB.
 
 ## Why NFS?
 
-NFS (especially v3) uses AUTH_SYS authentication, which sends UID/GID values in plaintext and the server blindly trusts them. There's no password, no Kerberos ticket, no challenge-response. If you can reach the NFS port, you can claim to be any non-root user on the system and read their files, or even root if `no_root_squash` is set.
+NFS (especially v3) authenticates with AUTH_SYS, which means the client sends a UID/GID in plaintext and the server takes its word for it. No password, no Kerberos ticket, no challenge-response. Reach the NFS port and you can claim to be any non-root user and read their files, or root itself if `no_root_squash` is set.
 
-Niffler automates the tedious parts: discovering exports, walking directory trees, spoofing UIDs, and pattern-matching file content against a library of credential signatures.
+Niffler handles the tedious parts: finding exports, walking the trees, spoofing UIDs, and matching file content against a library of credential patterns.
 
-## Quick Start
+## Install
 
-### Install
+Three ways to get it:
 
-**Option 1** — Download a prebuilt binary from the [Releases](https://github.com/dejisec/niffler/releases) page.
+**Prebuilt binary** — grab one from the [Releases](https://github.com/dejisec/niffler/releases) page.
 
-**Option 2** — Install via cargo (requires [libnfs-dev](https://github.com/sahlberg/libnfs)):
+**Cargo** (needs [libnfs-dev](https://github.com/sahlberg/libnfs)):
 
 ```bash
 cargo install --git https://github.com/dejisec/niffler
 ```
 
-**Option 3** — Build from source (requires [libnfs-dev](https://github.com/sahlberg/libnfs)):
+**From source** (needs [libnfs-dev](https://github.com/sahlberg/libnfs)):
 
 ```bash
 git clone https://github.com/dejisec/niffler && cd niffler
@@ -33,24 +33,26 @@ cargo build --release
 cp target/release/niffler .
 ```
 
+## Quick start
+
 ```bash
 # Scan a single NFS server
 ./niffler scan -t 10.0.0.5
 
-# Scan a subnet
+# Scan a whole subnet
 ./niffler scan -t 192.168.1.0/24
 
-# Just recon — list servers, exports, and misconfigs without touching files
+# Recon only: list servers, exports, and misconfigs without reading files
 ./niffler scan -t 10.0.0.0/24 --mode recon
 
-# Browse results in the web dashboard
+# Review results in the web dashboard
 ./niffler serve --db niffler.db
 
 # Export findings as JSON
 ./niffler export --db niffler.db -f json
 ```
 
-## Operating Modes
+## Operating modes
 
 Niffler runs in three modes, so you can dial in how deep you want to go:
 
@@ -60,91 +62,70 @@ Niffler runs in three modes, so you can dial in how deep you want to go:
 | `enum` | Above + walks directory trees, matches filenames against rules | You want to see what's there without reading file content |
 | `scan` | Above + reads file content and applies regex patterns | You want the full picture (default) |
 
-```bash
-./niffler scan -t 10.0.0.0/24 -m recon    # Discovery only
-./niffler scan -t 10.0.0.0/24 -m enum     # Discovery + tree walk
-./niffler scan -t 10.0.0.0/24             # Full scan (default)
-```
-
-## Usage Examples
+## Recipes
 
 ```bash
-# Scan and only show high-severity findings (Red and Black)
+# Only show high-severity findings (Red and Black)
 ./niffler scan -t nfs-server.internal -b red
 
-# Scan with live console output alongside database write
-./niffler scan -t nfs-server.internal --live
-
-# Scan as a specific user (e.g., UID 1000 found during recon)
+# Scan as a specific user (e.g. a UID you found during recon)
 ./niffler scan -t nfs-server.internal --uid 1000 --gid 1000
 
-# Scan through a SOCKS5 proxy
+# Route through a SOCKS5 proxy
 ./niffler scan -t 10.0.0.5 --proxy socks5://127.0.0.1:1080
 
-# Scan local/mounted NFS shares directly (no network discovery)
+# Scan local or already-mounted shares, skipping network discovery
 ./niffler scan -i /mnt/nfs_share1 /mnt/nfs_share2
 
-# Read targets from a file (one per line, supports CIDR)
+# Read targets from a file (one per line, CIDR ok; use - for stdin)
 ./niffler scan -T targets.txt
 
-# Read targets from stdin
-cat targets.txt | ./niffler scan -T -
-
-# Scan a subnet but skip specific hosts
+# Scan a subnet but skip a few hosts
 ./niffler scan -t 10.0.0.0/24 -x 10.0.0.5 10.0.0.99
 
-# Exclude hosts listed in a file (one per line, supports CIDR)
-./niffler scan -t 10.0.0.0/24 -X exclude.txt
-
-# Check for subtree_check bypass (filehandle escape from export boundary)
-./niffler scan -t 192.168.0.0/16 --check-subtree-bypass
-
-# Write results to a custom database path
+# Write results to a custom database
 ./niffler scan -t 10.0.0.0/24 -o engagement.db
 
-# Generate a config template, tweak it, and reuse
+# Generate a config template, edit it, then reuse
 ./niffler scan -z > niffler.toml
-# (edit niffler.toml to taste)
 ./niffler scan -c niffler.toml -t 10.0.0.0/24
 
-# Launch the web dashboard to review findings
-./niffler serve --db niffler.db
+# Serve the dashboard on a specific address
 ./niffler serve --db niffler.db --port 9090 --bind 0.0.0.0
 
-# Export findings from the database
-./niffler export --db niffler.db -f json
+# Export Red+ findings as CSV, or a single host as TSV
 ./niffler export --db niffler.db -f csv -b red
-./niffler export --db niffler.db -f tsv --host 10.0.0.5 --scan-id 3
+./niffler export --db niffler.db -f tsv --host 10.0.0.5
 ```
+
+Every flag is documented in `niffler scan --help` (and likewise `serve --help` and `export --help`).
 
 ## Output
 
-All scan results are written to a SQLite database (`niffler.db` by default).
+All results land in a SQLite database (`niffler.db` by default).
 
-### Live Console (`--live`)
+### Live dashboard
 
-Add `--live` to see findings in the terminal as they're discovered, alongside the database write:
+In an interactive terminal, Niffler shows a full-screen dashboard while it scans: phase progress, a live severity-colored findings feed (scroll with the arrows/PgUp/PgDn, filter with `f`, pause with `p`), and a log pane. Press `q` or Ctrl-C to stop, and it prints a summary card on the way out.
+
+Outside a terminal (pipes, redirects, CI), it switches to plain line output: heartbeat progress plus one line per finding on stdout, safe to pipe. Force either mode with `--tui` or `--plain`.
 
 ```
-[2026-03-17 14:23:01] [BLACK] [SshPrivateKeys] [RW-] nfs-server:/exports/home/user1/.ssh/id_rsa (1.7 KB, uid:1001, gid:1001, 2025-11-03)
-[2026-03-17 14:23:02] [RED] [CredentialPatterns] [RW-] nfs-server:/exports/app/.env (423 B, uid:1000, gid:1000, 2026-01-15)
-    Context: "DB_PASSWORD=s3cretP@ss123"
-[2026-03-17 14:23:03] [RED] [AwsAccessKeys] [RW-] nfs-server:/exports/home/deploy/.aws/credentials (240 B, uid:1002, gid:1002, 2025-09-22)
-    Context: "aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+./niffler scan -t 10.0.0.5 --plain | grep BLACK
 ```
 
-### Web Dashboard (`serve`)
+### Web dashboard (`serve`)
 
-Launch a local web UI for interactive triage — filter, star, and review findings in your browser:
+Launch a local web UI to review findings in your browser. Filter the list, star anything worth a second look, and open a finding to see its match in context:
 
 ```bash
 ./niffler serve --db niffler.db
-# Open http://127.0.0.1:8080
+# then open http://127.0.0.1:8080
 ```
 
 ### Export (`export`)
 
-Export findings from the database as JSON lines, CSV, or TSV:
+Pull findings out of the database as JSON lines, CSV, or TSV:
 
 ```bash
 ./niffler export --db niffler.db -f json                 # JSON lines to stdout
@@ -152,7 +133,7 @@ Export findings from the database as JSON lines, CSV, or TSV:
 ./niffler export --db niffler.db -f tsv --host 10.0.0.5  # TSV, single host
 ```
 
-## Severity Levels
+## Severity levels
 
 Findings are triaged into four levels. Use `-b` to set a minimum severity threshold.
 
@@ -168,7 +149,7 @@ Findings are triaged into four levels. Use `-b` to set a minimum severity thresh
 ./niffler scan -t 10.0.0.5 -b black    # Only Black findings
 ```
 
-## How It Works
+## How it works
 
 Niffler runs as a multi-phase async pipeline:
 
@@ -187,9 +168,9 @@ Targets ──► Discovery ──► Tree Walker ──► File Scanner ──�
 
 **Tree Walker** does a parallel recursive READDIRPLUS traversal of each export (`--parallel-dirs` concurrent directory listings), applying directory discard rules to prune uninteresting paths early.
 
-**File Scanner** reads file content and runs it through the rule engine using a connection pool (`--max-connections-per-host`). If a file is permission-denied, Niffler automatically cycles through harvested UIDs (AUTH_SYS spoofing) to try accessing it as different users. Failed reads are retried with exponential backoff (`--scan-retries`).
+**File Scanner** reads file content and runs it through the rule engine using a connection pool (`--max-connections-per-host`). When a file is permission-denied, Niffler cycles through harvested UIDs (AUTH_SYS spoofing) to try reading it as different users. Failed reads are retried with exponential backoff (`--scan-retries`).
 
-**Circuit Breaker** monitors error rates per host. If a server's error rate exceeds 80% within a sliding window (after at least `--error-threshold` events), the host is temporarily suspended for `--cooldown-secs` to avoid hammering unhealthy servers.
+**Circuit Breaker** watches the error rate per host. If a server's error rate climbs past 80% within a sliding window (after at least `--error-threshold` events), the host is suspended so Niffler stops hammering an unhealthy server. The first cooldown lasts `--cooldown-secs`; each repeat trip doubles it, up to 64×.
 
 **UID Cycling** is the secret sauce. When the scanner hits a permission wall, it tries:
 
@@ -197,23 +178,21 @@ Targets ──► Discovery ──► Tree Walker ──► File Scanner ──�
 2. The file's owning UID (from stat — most likely to work)
 3. UIDs harvested during discovery (from directory listings)
 
-Each UID attempt creates a new NFS connection with fresh AUTH_SYS credentials. NFS file handles are cross-connection valid, so a handle obtained by the walker can be read by the scanner using a completely different UID.
+Each attempt opens a new NFS connection with fresh AUTH_SYS credentials. NFS file handles are valid across connections, so a handle the walker obtained can be read by the scanner under a completely different UID.
 
 ### NFSv4
 
-Niffler supports NFSv4 via [libnfs](https://github.com/sahlberg/libnfs). Force it with `--nfs-version 4`:
+Niffler supports NFSv4 via [libnfs](https://github.com/sahlberg/libnfs). When you don't specify a version it defaults to NFSv3; force v4 when the target only exposes v4 or you want to test v4-specific behavior:
 
 ```bash
 ./niffler scan -t 10.0.0.5 --nfs-version 4
 ```
 
-When no version is specified, Niffler defaults to NFSv3. NFSv4 is useful when the target only exposes v4, or when you want to test v4-specific behaviors.
-
-## Rule Engine
+## Rule engine
 
 Rules are defined in TOML and compiled into the binary. The engine uses a **relay-chain architecture** (borrowed from Snaffler): cheap rules gate expensive ones.
 
-For example, a file named `.env` first matches a filename rule (instant). That rule *relays* to content rules, which read the file and apply regex patterns (expensive). This way, regex only runs on files that are likely to contain something interesting.
+Take a file named `.env`. It first matches a filename rule (instant). That rule *relays* to content rules, which read the file and apply regex patterns (expensive). So the regex only runs on files that are already likely to contain something interesting.
 
 ```
 .env file found
@@ -230,9 +209,9 @@ Rules have four scopes:
 - **FileEnumeration** — applied to filenames/extensions/paths in the scanner
 - **ContentsEnumeration** — applied to file content (most expensive, gated by relays)
 
-### Custom Rules
+### Custom rules
 
-Replace the defaults entirely or merge your own rules on top:
+Replace the defaults entirely or merge your own on top:
 
 ```bash
 # Replace all built-in rules with your own
@@ -258,110 +237,18 @@ context_bytes = 200
 description = "Custom internal API key pattern"
 ```
 
-## Misconfiguration Detection
+## Misconfiguration detection
 
 During discovery, Niffler probes each export for common NFS misconfigurations:
 
 | Check | What it means | How Niffler tests it |
 |-------|---------------|---------------------|
-| **no_root_squash** | Server trusts UID 0 — you can read/write anything as root | Connects as UID 0, attempts `getattr` on the export root |
+| **no_root_squash** | UID 0 isn't squashed, so root may be able to read or write anything | Connects as UID 0 and tries `getattr` on the export root. A success is a strong hint, not proof: a squashed `nobody` can still stat a world-readable root |
 | **insecure** | Export accepts connections from unprivileged ports (>1024) | Connects from a high port, checks if `getattr` succeeds |
 | **subtree_check bypass** | File handles can escape the export boundary | Looks up `..` from the export root, checks if the returned handle differs |
 
+The subtree bypass check is off by default since it adds an extra probe per export. Turn it on with `--check-subtree-bypass`:
+
 ```bash
-# Enable subtree bypass check (off by default, adds extra probe per export)
 ./niffler scan -t 10.0.0.0/24 --check-subtree-bypass
 ```
-
-## CLI Reference
-
-### Global Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-v, --verbosity` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
-
-### `niffler scan` — Scan NFS shares for secrets
-
-#### Targets
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-t, --targets` | IP addresses, hostnames, or CIDR ranges | — |
-| `-T, --target-file` | Read targets from file (one per line, `-` for stdin) | — |
-| `-i, --local-path` | Scan local/mounted paths instead of NFS discovery | — |
-| `-x, --exclude` | Hosts to exclude: IP addresses, hostnames, or CIDR ranges | — |
-| `-X, --exclude-file` | Read hosts to exclude from file (one per line, `-` for stdin) | — |
-
-#### Mode & Output
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-m, --mode` | Operating mode: `recon`, `enum`, `scan` | `scan` |
-| `-o, --output` | SQLite database path for results | `niffler.db` |
-| `-l, --live` | Print findings to terminal alongside database write | `false` |
-| `-b, --min-severity` | Minimum triage level: `green`, `yellow`, `red`, `black` | `green` |
-
-#### NFS Authentication
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--uid` | UID for AUTH_SYS credentials | `65534` (nobody) |
-| `--gid` | GID for AUTH_SYS credentials | `65534` (nobody) |
-| `--no-uid-cycle` | Disable auto-cycling through harvested UIDs on permission denied | `false` |
-| `--max-uid-attempts` | Max UID attempts per file before giving up | `5` |
-| `--nfs-version` | Force NFS version: `3` or `4` (auto-detect if not set) | — |
-| `--no-privileged-port` | Disable binding source port < 1024 | `false` |
-| `--proxy` | SOCKS5 proxy URL (e.g., `socks5://127.0.0.1:1080`) | — |
-
-#### Concurrency & Limits
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--max-connections-per-host` | Max concurrent NFS connections per server | `8` |
-| `--discovery-tasks` | Max concurrent discovery tasks | `30` |
-| `--discovery-timeout` | Timeout in seconds for discovery network operations | `5` |
-| `--walker-tasks` | Max concurrent tree walk tasks (one per export) | `20` |
-| `--scanner-tasks` | Max concurrent file scan tasks | `50` |
-| `--max-depth` | Max directory depth during tree walk | `50` |
-| `--parallel-dirs` | Max concurrent directory listings per export during tree walk | `8` |
-| `--walk-retries` | Max retries per export walk on connection loss (0 = no retry) | `2` |
-| `--walk-retry-delay` | Base delay between walk retries (ms, exponential backoff with jitter) | `500` |
-| `--scan-retries` | Max retries per file scan on connection loss (0 = no retry) | `2` |
-| `--scan-retry-delay` | Base delay between scanner retries (ms, exponential backoff with jitter) | `200` |
-| `--connect-timeout` | Timeout in seconds for establishing NFS connections | `10` |
-| `--nfs-timeout` | Timeout in seconds for individual NFS operations (read, readdirplus) | `30` |
-| `--task-timeout` | Timeout in seconds for entire scanner task | `300` |
-| `--max-scan-size` | Max file size to read content from (bytes) | `1048576` (1 MB) |
-| `--read-chunk-size` | NFS read chunk size in bytes | `1048576` (1 MB) |
-| `--error-threshold` | Min events in health window before circuit breaker evaluates error rate | `10` |
-| `--cooldown-secs` | Cooldown duration in seconds after circuit breaker trips | `60` |
-
-#### Rules & Config
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-r, --rules-dir` | Custom rules directory (replaces defaults) | — |
-| `-R, --extra-rules` | Additional rules directory (merged with defaults) | — |
-| `-c, --config` | Load config from TOML file | — |
-| `-z, --generate-config` | Print current config as TOML and exit | `false` |
-| `--check-subtree-bypass` | Enable subtree_check bypass detection | `false` |
-
-### `niffler serve` — Launch web dashboard
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--db` | Path to SQLite database (required) | — |
-| `--port` | Port to listen on | `8080` |
-| `--bind` | Address to bind to | `127.0.0.1` |
-
-### `niffler export` — Export findings to stdout
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--db` | Path to SQLite database (required) | — |
-| `-f, --format` | Output format: `json`, `csv`, `tsv` (required) | — |
-| `-b, --min-severity` | Minimum triage level filter | — |
-| `--host` | Filter by host | — |
-| `--rule` | Filter by rule name | — |
-| `--scan-id` | Filter by scan ID | — |

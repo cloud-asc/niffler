@@ -9,7 +9,7 @@ pub mod v3;
 pub mod v4;
 
 pub use auth::{AuthCreds, AuthStrategy};
-pub use connector::NfsConnector;
+pub use connector::{ConnectorFactory, NfsConnector};
 pub use errors::{ErrorClass, NfsError, classify_error};
 pub use ops::NfsOps;
 pub use socks::SocksConnector;

@@ -69,6 +69,7 @@ pub(crate) async fn walk_subtrees_parallel(
                         host: export.host.clone(),
                         export: export.export_path.clone(),
                     },
+                    nfs_version: export.nfs_version,
                     harvested_uids: export.harvested_uids.clone(),
                 })
                 .await?;
@@ -569,10 +570,8 @@ mod tests {
         connector.expect_connect().returning(move |_, _, _| {
             let n = call_count_clone.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                // First attempt fails with transient error
                 return Err(Box::new(NfsError::ConnectionLost));
             }
-            // Second attempt succeeds
             let sub = sub_fh_clone.clone();
             let mut ops = MockNfsOps::new();
             ops.expect_root_handle().return_const(NfsFh::new(vec![1]));

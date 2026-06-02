@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
-use indicatif::MultiProgress;
 use tokio_util::sync::CancellationToken;
 
 use crate::classifier::{RuleEngine, load_embedded_defaults, load_rules_from_dir, merge_rules};
 use crate::config::NifflerConfig;
-use crate::nfs::{AuthCreds, AuthStrategy, NfsConnector};
+use crate::nfs::{AuthCreds, AuthStrategy, ConnectorFactory};
 use crate::{discovery, output, scanner, walker};
 
 use super::channels::PipelineChannels;
 use super::connections::HostConnectionPool;
 use super::error::PipelineError;
 use super::health::HostHealthRegistry;
-use super::progress::ProgressDisplay;
 use super::stats::PipelineStats;
 
 /// Load and compile the rule engine from config.
@@ -45,14 +43,32 @@ fn build_rules(config: &NifflerConfig) -> Result<RuleEngine, PipelineError> {
 
 /// Wire all pipeline phases together and run to completion.
 ///
-/// - `connector` is shared by walker + scanner for NFS operations.
-/// - `cancel`: `None` creates an internal token with Ctrl+C handler;
-///   `Some(token)` uses the provided token (for testing).
+/// - `connector_factory` supplies version-matched connectors to walker + scanner.
+/// - `cancel`: `None` creates a default token; `Some(token)` uses the provided
+///   token (for testing). A Ctrl+C backstop is always installed.
 pub async fn run_pipeline(
     config: NifflerConfig,
-    connector: Arc<dyn NfsConnector>,
+    connector_factory: ConnectorFactory,
     cancel: Option<CancellationToken>,
-    multi: Option<MultiProgress>,
+    reporter: crate::tui::ReporterHandle,
+) -> Result<PipelineStats, PipelineError> {
+    let stats = Arc::new(PipelineStats::default());
+    run_pipeline_with_stats(
+        config,
+        connector_factory,
+        cancel.unwrap_or_default(),
+        reporter,
+        stats,
+    )
+    .await
+}
+
+pub async fn run_pipeline_with_stats(
+    config: NifflerConfig,
+    connector_factory: ConnectorFactory,
+    cancel: CancellationToken,
+    reporter: crate::tui::ReporterHandle,
+    stats: Arc<PipelineStats>,
 ) -> Result<PipelineStats, PipelineError> {
     let rules = Arc::new(build_rules(&config)?);
 
@@ -64,20 +80,17 @@ pub async fn run_pipeline(
         .map_err(|e| PipelineError::Config(e.to_string()))?;
 
     let channels = PipelineChannels::default();
-    let stats = Arc::new(PipelineStats::default());
 
-    let token = cancel.unwrap_or_else(|| {
-        let t = CancellationToken::new();
-        let t2 = t.clone();
+    let token = cancel;
+    {
+        let t2 = token.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             tracing::warn!("received Ctrl+C, shutting down...");
             t2.cancel();
         });
-        t
-    });
+    }
 
-    // Build auth strategy from config
     let default_creds = AuthCreds::new(config.scanner.uid, config.scanner.gid);
     let auth = AuthStrategy {
         primary: default_creds.clone(),
@@ -86,35 +99,30 @@ pub async fn run_pipeline(
         max_attempts: config.scanner.max_uid_attempts,
     };
 
-    // Progress bars — caller passes Some(MultiProgress) when enabled
-    let progress = Arc::new(ProgressDisplay::new(multi, config.output.min_severity));
-
-    // Spawn progress updater task
-    let progress_handle = {
-        let stats = Arc::clone(&stats);
-        let progress = Arc::clone(&progress);
-        let token = token.clone();
-        tokio::spawn(async move {
-            while !token.is_cancelled() {
-                progress.update_from_stats(&stats);
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        })
-    };
-
     let config = Arc::new(config);
     let mode = config.mode;
 
     // Phase 1: Discovery (always runs)
     let discovery_handle = {
         let export_tx = channels.export_tx.clone();
+        let export_meta_tx = channels.export_meta_tx.clone();
         let result_tx = channels.result_tx.clone();
         let token = token.clone();
         let stats = Arc::clone(&stats);
         let config = Arc::clone(&config);
         let rules = Arc::clone(&rules);
         tokio::spawn(async move {
-            discovery::run(&config, targets, export_tx, result_tx, token, stats, rules).await
+            discovery::run(
+                &config,
+                targets,
+                export_tx,
+                export_meta_tx,
+                result_tx,
+                token,
+                stats,
+                rules,
+            )
+            .await
         })
     };
 
@@ -130,7 +138,7 @@ pub async fn run_pipeline(
     // Phase 2: TreeWalk (runs in enumerate + scan modes)
     let walker_handle = if mode.runs_walker() {
         let file_tx = channels.file_tx.clone();
-        let connector = Arc::clone(&connector);
+        let connector_factory = connector_factory.clone();
         let rules = Arc::clone(&rules);
         let token = token.clone();
         let stats = Arc::clone(&stats);
@@ -144,7 +152,7 @@ pub async fn run_pipeline(
             walker::run(
                 channels.export_rx,
                 file_tx,
-                connector,
+                connector_factory,
                 rules,
                 &walker_config,
                 creds,
@@ -164,7 +172,7 @@ pub async fn run_pipeline(
     let scanner_handle = if mode.runs_walker() {
         let result_tx = channels.result_tx.clone();
         let rules = Arc::clone(&rules);
-        let connector = Arc::clone(&connector);
+        let connector_factory = connector_factory.clone();
         let auth = auth.clone();
         let token = token.clone();
         let stats = Arc::clone(&stats);
@@ -176,7 +184,7 @@ pub async fn run_pipeline(
                 channels.file_rx,
                 result_tx,
                 rules,
-                connector,
+                connector_factory,
                 auth,
                 &scanner_config,
                 mode,
@@ -192,7 +200,7 @@ pub async fn run_pipeline(
         None
     };
 
-    // Output sink (always runs — drains result_rx, writes SQLite + optional console)
+    // Output sink (always runs — drains result_rx + export_meta_rx, writes SQLite + reporter tee)
     let output_handle = {
         let output_config = config.output.clone();
         let mut targets = config.discovery.targets.clone().unwrap_or_default();
@@ -201,13 +209,17 @@ pub async fn run_pipeline(
         }
         let mode_str = config.mode.to_string();
         let stats = Arc::clone(&stats);
+        let reporter = reporter.clone();
+        let export_meta_rx = channels.export_meta_rx;
         tokio::spawn(async move {
             output::run(
                 channels.result_rx,
+                export_meta_rx,
                 &output_config,
                 &targets,
                 &mode_str,
                 stats,
+                reporter,
             )
             .await
         })
@@ -245,6 +257,7 @@ pub async fn run_pipeline(
         }
     }
     drop(channels.export_tx);
+    drop(channels.export_meta_tx);
 
     if let Some(mut handle) = walker_handle {
         tokio::select! {
@@ -317,13 +330,6 @@ pub async fn run_pipeline(
         }
     }
 
-    // Finish progress bars and stop updater
-    progress.update_from_stats(&stats);
-    progress.finish();
-    progress_handle.abort();
-    let _ = progress_handle.await; // Ensure task's Arc<PipelineStats> is dropped
-    drop(progress); // Drop the Arc<ProgressDisplay>
-
     Ok(match Arc::try_unwrap(stats) {
         Ok(s) => s,
         Err(arc) => {
@@ -342,6 +348,7 @@ mod tests {
     use crate::config::{
         DiscoveryConfig, OperatingMode, OutputConfig, ScannerConfig, WalkerConfig,
     };
+    use crate::nfs::NfsConnector;
     use crate::nfs::connector::MockNfsConnector;
 
     fn test_config(mode: OperatingMode) -> NifflerConfig {
@@ -362,6 +369,7 @@ mod tests {
             walker: WalkerConfig {
                 walker_tasks: 10,
                 max_depth: 50,
+                max_dir_entries: 1_000_000,
                 local_paths: None,
                 max_connections_per_host: 8,
                 walk_retries: 2,
@@ -390,7 +398,7 @@ mod tests {
             },
             output: OutputConfig {
                 db_path: std::env::temp_dir().join("niffler_test_pipeline.db"),
-                live: false,
+                display: crate::tui::DisplayMode::Auto,
                 min_severity: Triage::Green,
             },
             health: crate::config::HealthConfig {
@@ -403,9 +411,9 @@ mod tests {
         }
     }
 
-    fn mock_connector() -> Arc<dyn NfsConnector> {
-        let mock = MockNfsConnector::new();
-        Arc::new(mock)
+    fn mock_connector() -> ConnectorFactory {
+        let mock: Arc<dyn NfsConnector> = Arc::new(MockNfsConnector::new());
+        ConnectorFactory::uniform(mock)
     }
 
     #[tokio::test]
@@ -416,7 +424,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 
@@ -441,7 +454,13 @@ mod tests {
         let connector = mock_connector();
         let token = CancellationToken::new();
 
-        let result = run_pipeline(config, connector, Some(token), None).await;
+        let result = run_pipeline(
+            config,
+            connector,
+            Some(token),
+            crate::tui::ReporterHandle::null(),
+        )
+        .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), PipelineError::Config(_)));
     }
@@ -455,7 +474,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 
@@ -471,7 +495,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 
@@ -499,7 +528,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 
@@ -525,7 +559,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 
@@ -603,7 +642,13 @@ triage = "Yellow"
         let connector = mock_connector();
         let token = CancellationToken::new();
 
-        let result = run_pipeline(config, connector, Some(token), None).await;
+        let result = run_pipeline(
+            config,
+            connector,
+            Some(token),
+            crate::tui::ReporterHandle::null(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "check_subtree_bypass flag should be accepted: {result:?}"
@@ -658,7 +703,12 @@ triage = "Green"
         // Before fix: hangs forever. After fix: returns in <1s.
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            run_pipeline(config, connector, Some(token), None),
+            run_pipeline(
+                config,
+                connector,
+                Some(token),
+                crate::tui::ReporterHandle::null(),
+            ),
         )
         .await;
 

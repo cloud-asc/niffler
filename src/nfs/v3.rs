@@ -103,6 +103,7 @@ fn filter_dot_entries(entries: Vec<DirEntry>) -> Vec<DirEntry> {
 pub struct Nfs3Connector {
     privileged_port: bool,
     proxy: Option<std::net::SocketAddr>,
+    max_dir_entries: usize,
 }
 
 impl Nfs3Connector {
@@ -111,6 +112,7 @@ impl Nfs3Connector {
         Self {
             privileged_port,
             proxy: None,
+            max_dir_entries: super::ops::DEFAULT_MAX_DIR_ENTRIES,
         }
     }
 
@@ -119,7 +121,15 @@ impl Nfs3Connector {
         Self {
             privileged_port: false,
             proxy: Some(proxy),
+            max_dir_entries: super::ops::DEFAULT_MAX_DIR_ENTRIES,
         }
+    }
+
+    /// Set the per-directory entry cap applied during `readdirplus` (0 = unlimited).
+    #[must_use]
+    pub fn with_max_dir_entries(mut self, max_dir_entries: usize) -> Self {
+        self.max_dir_entries = max_dir_entries;
+        self
     }
 }
 
@@ -158,7 +168,11 @@ impl NfsConnector for Nfs3Connector {
         };
 
         let root_fh = NfsFh::from(conn.root_nfs_fh3());
-        Ok(Box::new(Nfs3Ops { conn, root_fh }))
+        Ok(Box::new(Nfs3Ops {
+            conn,
+            root_fh,
+            max_dir_entries: self.max_dir_entries,
+        }))
     }
 
     async fn detect_version(&self, host: &str) -> connector::Result<NfsVersion> {
@@ -180,6 +194,7 @@ type NfsIo = TokioIo<tokio::net::TcpStream>;
 struct Nfs3Ops {
     conn: Nfs3Connection<NfsIo>,
     root_fh: NfsFh,
+    max_dir_entries: usize,
 }
 
 #[async_trait::async_trait]
@@ -215,6 +230,15 @@ impl NfsOps for Nfs3Ops {
                 if let Some(de) = convert_entry(entry) {
                     all_entries.push(de);
                 }
+            }
+
+            if super::ops::dir_entry_cap_reached(all_entries.len(), self.max_dir_entries) {
+                tracing::warn!(
+                    cap = self.max_dir_entries,
+                    "directory entry cap reached; truncating listing"
+                );
+                all_entries.truncate(self.max_dir_entries);
+                break;
             }
 
             if eof || ok.reply.entries.0.is_empty() {

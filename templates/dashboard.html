@@ -3,6 +3,21 @@
 {% block content %}
 <h1 class="page-title">Dashboard</h1>
 
+{% if let Some(s) = latest_scan %}
+<div class="card latest-scan">
+    <div class="card-header">Latest scan</div>
+    <div class="latest-scan-row">
+        <span class="ls-targets mono">{{ s.display_targets() }}</span>
+        <span class="ls-mode">{{ s.mode }}</span>
+        <span class="scan-status status-{{ s.status }}">{{ s.status }}</span>
+        <span class="ls-stat">{{ s.total_hosts }} hosts</span>
+        <span class="ls-stat">{{ s.total_exports }} exports</span>
+        <span class="ls-stat">{{ s.total_findings }} findings</span>
+        <span class="ls-time text-dim">{{ s.display_started() }} → {{ s.display_completed() }}</span>
+    </div>
+</div>
+{% endif %}
+
 <div class="stats-grid">
     <a href="/findings?triage=Black" class="card stat-card stat-card-link">
         <div class="stat-number sev-black">{{ count_black }}</div>

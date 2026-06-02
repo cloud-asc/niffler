@@ -34,6 +34,9 @@ pub struct FileMsg {
     pub file_handle: NfsFh,
     pub attrs: NfsAttrs,
     pub reader: FileReader,
+    /// NFS protocol version of the export this file belongs to, so the scanner
+    /// reads content with a matching connector. Ignored for local-path reads.
+    pub nfs_version: NfsVersion,
     /// UID/GID pairs harvested during discovery for this export.
     pub harvested_uids: Vec<AuthCreds>,
 }
@@ -61,6 +64,8 @@ pub struct ResultMsg {
 pub struct PipelineChannels {
     pub export_tx: Sender<ExportMsg>,
     pub export_rx: Receiver<ExportMsg>,
+    pub export_meta_tx: Sender<ExportMsg>,
+    pub export_meta_rx: Receiver<ExportMsg>,
     pub file_tx: Sender<FileMsg>,
     pub file_rx: Receiver<FileMsg>,
     pub result_tx: Sender<ResultMsg>,
@@ -78,11 +83,14 @@ impl PipelineChannels {
         let file_bound = file_bound.max(1);
         let result_bound = result_bound.max(1);
         let (export_tx, export_rx) = tokio::sync::mpsc::channel(export_bound);
+        let (export_meta_tx, export_meta_rx) = tokio::sync::mpsc::channel(export_bound);
         let (file_tx, file_rx) = tokio::sync::mpsc::channel(file_bound);
         let (result_tx, result_rx) = tokio::sync::mpsc::channel(result_bound);
         Self {
             export_tx,
             export_rx,
+            export_meta_tx,
+            export_meta_rx,
             file_tx,
             file_rx,
             result_tx,

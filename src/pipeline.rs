@@ -4,7 +4,6 @@ pub mod connections;
 pub mod error;
 pub mod health;
 pub mod orchestrator;
-pub mod progress;
 pub mod stats;
 
 pub use backoff::RetryPolicy;
@@ -17,6 +16,5 @@ pub use error::PipelineError;
 pub use health::{
     DEFAULT_COOLDOWN_DURATION, DEFAULT_ERROR_THRESHOLD, HostHealth, HostHealthRegistry,
 };
-pub use orchestrator::run_pipeline;
-pub use progress::{IndicatifWriter, ProgressDisplay};
-pub use stats::{PipelineStats, StatsFormatter};
+pub use orchestrator::{run_pipeline, run_pipeline_with_stats};
+pub use stats::PipelineStats;

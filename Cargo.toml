@@ -1,10 +1,10 @@
 [package]
 name = "niffler"
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
 description = "NFS share secret finder"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.95"
 
 [[bin]]
 name = "niffler"
@@ -31,8 +31,9 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"                                              
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-colored = "3"            
-indicatif = "0.18"       
+colored = "3"
+ratatui = "0.29"
+crossterm = "0.28"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"                                                    
 thiserror = "2"       

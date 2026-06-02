@@ -18,6 +18,36 @@ use crate::nfs::types::{NfsExport, NfsVersion};
 use crate::nfs::v3::Nfs3Connector;
 use crate::pipeline::{ExportMsg, PipelineStats, ResultMsg, RetryPolicy};
 
+/// Which export-discovery method to use for a scanned host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryMethod {
+    /// v3 MOUNT protocol (portmapper + mountd) export listing.
+    V3Mount,
+    /// v4 pseudo-filesystem readdir of the pseudo-root.
+    V4Pseudo,
+}
+
+/// Ordered export-discovery methods to attempt for a scanned host.
+///
+/// The portmapper cannot reliably tell us whether MOUNT *v3* specifically is
+/// available — rpcbind answers GETPORT for a registered *program* regardless of
+/// the requested version, so a v4-only server (mountd v1/v2 only, NFS 100003 v4)
+/// still looks like it has MOUNT. So instead of deciding up front, we *attempt*
+/// the methods in order and fall back: try v3 MOUNT listing when rpcbind
+/// advertises NFS, then v4 pseudo-root discovery when NFS is reachable on 2049.
+/// The caller uses the first method that yields a non-empty export set.
+#[must_use]
+pub fn discovery_attempts(nfs_via_rpcbind: bool, nfs_direct_open: bool) -> Vec<DiscoveryMethod> {
+    let mut attempts = Vec::new();
+    if nfs_via_rpcbind {
+        attempts.push(DiscoveryMethod::V3Mount);
+    }
+    if nfs_direct_open {
+        attempts.push(DiscoveryMethod::V4Pseudo);
+    }
+    attempts
+}
+
 /// Retry an async operation with exponential backoff and jitter.
 async fn retry_with_backoff<F, Fut, T>(
     max_retries: usize,
@@ -51,6 +81,7 @@ async fn process_host_exports(
     nfs_exports: Vec<NfsExport>,
     connector: &dyn NfsConnector,
     export_tx: &Sender<ExportMsg>,
+    export_meta_tx: &Sender<ExportMsg>,
     result_tx: &Sender<ResultMsg>,
     mode: OperatingMode,
     nfs_version: NfsVersion,
@@ -121,6 +152,10 @@ async fn process_host_exports(
             misconfigs: misconfigs.clone(),
         };
 
+        // Persist export metadata for every mode (recon included). Best-effort:
+        // a closed meta channel (output sink gone) must not abort discovery.
+        let _ = export_meta_tx.send(msg.clone()).await;
+
         // Only send ExportMsg when walker is running (Enumerate/Scan).
         // In Recon mode, export_rx is already dropped so sends would fail.
         if mode.runs_walker() && export_tx.send(msg).await.is_err() {
@@ -163,10 +198,12 @@ async fn process_host_exports(
 /// Targets are resolved by the pipeline orchestrator before this function is
 /// called, so that a config error (e.g. all targets excluded) fails the run
 /// with a clear message rather than being silently swallowed.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: &NifflerConfig,
     targets: Vec<crate::discovery::TargetHost>,
     export_tx: Sender<ExportMsg>,
+    export_meta_tx: Sender<ExportMsg>,
     result_tx: Sender<ResultMsg>,
     token: CancellationToken,
     stats: Arc<PipelineStats>,
@@ -219,6 +256,7 @@ pub async fn run(
         let sem = Arc::clone(&sem);
         let connector = Arc::clone(&connector);
         let export_tx = export_tx.clone();
+        let export_meta_tx = export_meta_tx.clone();
         let result_tx = result_tx.clone();
         let token = token.clone();
         let stats = Arc::clone(&stats);
@@ -234,39 +272,53 @@ pub async fn run(
                 return;
             };
 
-            // Determine export list and NFS version based on port scan
-            let (nfs_exports, version) = if nfs_via_rpcbind {
-                // NFSv3 path: portmapper + mount client (retry once on transient failure)
-                let exports = match retry_with_backoff(
-                    1,
-                    Duration::from_millis(500),
-                    || super::exports::list_exports(&host, proxy, timeout_secs),
-                )
-                .await
-                {
-                    Ok(exports) => exports,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("MOUNT service not registered") {
-                            tracing::debug!(host = %host, error = %e, "failed to list exports after retries");
-                        } else {
-                            debug!(host = %host, error = %e, "failed to list exports after retries");
+            // Enumerate exports by trying methods in order and using the first that
+            // yields a non-empty set. The portmapper can't reliably report whether
+            // MOUNT *v3* is available (rpcbind answers GETPORT per-program, not
+            // per-version), so a v4-only server still looks MOUNT-capable. Rather
+            // than guess, attempt v3 MOUNT listing then fall back to v4 pseudo-root
+            // discovery — which is what lets a v4-only host be scanned.
+            let mut discovered: Option<(Vec<NfsExport>, NfsVersion)> = None;
+            for method in discovery_attempts(nfs_via_rpcbind, nfs_direct_open) {
+                match method {
+                    DiscoveryMethod::V3Mount => {
+                        match retry_with_backoff(
+                            1,
+                            Duration::from_millis(500),
+                            || super::exports::list_exports(&host, proxy, timeout_secs),
+                        )
+                        .await
+                        {
+                            Ok(exports) if !exports.is_empty() => {
+                                discovered = Some((exports, NfsVersion::V3));
+                                break;
+                            }
+                            Ok(_) => {
+                                debug!(host = %host, "MOUNT listing returned no exports; trying next method");
+                            }
+                            Err(e) => {
+                                debug!(host = %host, error = %e, "MOUNT listing failed; trying next method");
+                            }
                         }
-                        return;
                     }
-                };
-                (exports, NfsVersion::V3)
-            } else if nfs_direct_open {
-                // NFSv4-only server: port 2049 open, no rpcbind
-                let exports = match super::v4_pseudo::discover_v4_exports(&host).await {
-                    Ok(exports) => exports,
-                    Err(e) => {
-                        debug!(host = %host, error = %e, "NFSv4 pseudo-root discovery failed");
-                        return;
+                    DiscoveryMethod::V4Pseudo => {
+                        match super::v4_pseudo::discover_v4_exports(&host).await {
+                            Ok(exports) if !exports.is_empty() => {
+                                discovered = Some((exports, NfsVersion::V4));
+                                break;
+                            }
+                            Ok(_) => {
+                                debug!(host = %host, "NFSv4 pseudo-root returned no exports; trying next method");
+                            }
+                            Err(e) => {
+                                debug!(host = %host, error = %e, "NFSv4 pseudo-root discovery failed; trying next method");
+                            }
+                        }
                     }
-                };
-                (exports, NfsVersion::V4)
-            } else {
+                }
+            }
+            let Some((nfs_exports, version)) = discovered else {
+                debug!(host = %host, "no exports discovered by any method");
                 return;
             };
 
@@ -275,6 +327,7 @@ pub async fn run(
                 nfs_exports,
                 connector.as_ref(),
                 &export_tx,
+                &export_meta_tx,
                 &result_tx,
                 mode,
                 version,
@@ -318,6 +371,37 @@ mod tests {
     use crate::nfs::errors::NfsError;
     use crate::nfs::ops::MockNfsOps;
     use crate::nfs::types::{DirEntry, NfsAttrs, NfsFh, NfsFileType};
+
+    #[test]
+    fn rpcbind_and_direct_tries_v3_then_v4() {
+        // A v4-only host looks MOUNT-capable via rpcbind and has 2049 open, so we
+        // attempt v3 first then fall back to v4 — the fallback is what scans it.
+        assert_eq!(
+            discovery_attempts(true, true),
+            vec![DiscoveryMethod::V3Mount, DiscoveryMethod::V4Pseudo]
+        );
+    }
+
+    #[test]
+    fn rpcbind_only_tries_v3_only() {
+        assert_eq!(
+            discovery_attempts(true, false),
+            vec![DiscoveryMethod::V3Mount]
+        );
+    }
+
+    #[test]
+    fn direct_only_tries_v4_only() {
+        assert_eq!(
+            discovery_attempts(false, true),
+            vec![DiscoveryMethod::V4Pseudo]
+        );
+    }
+
+    #[test]
+    fn neither_has_no_attempts() {
+        assert!(discovery_attempts(false, false).is_empty());
+    }
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
 
@@ -379,6 +463,7 @@ mod tests {
     async fn orchestrator_sends_export_msg_per_export() {
         let mock = mock_connector_success(vec![]);
         let (export_tx, mut export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -388,6 +473,7 @@ mod tests {
             two_exports(),
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,
@@ -417,6 +503,7 @@ mod tests {
         let entries = vec![make_entry("a", 1000, 1000), make_entry("b", 1001, 1001)];
         let mock = mock_connector_success(entries);
         let (export_tx, mut export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -431,6 +518,7 @@ mod tests {
             exports,
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,
@@ -472,6 +560,7 @@ mod tests {
         });
 
         let (export_tx, mut export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -486,6 +575,7 @@ mod tests {
             exports,
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,
@@ -526,6 +616,7 @@ mod tests {
         });
 
         let (export_tx, mut export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -546,6 +637,7 @@ mod tests {
             exports,
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,
@@ -591,6 +683,7 @@ mod tests {
         });
 
         let (export_tx, _export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, mut result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -605,6 +698,7 @@ mod tests {
             exports,
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Recon,
             NfsVersion::V3,
@@ -636,9 +730,10 @@ mod tests {
     async fn orchestrator_respects_cancellation_token() {
         let mock = mock_connector_success(vec![]);
         let (export_tx, mut export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
-        token.cancel(); // Cancel before processing
+        token.cancel();
         let stats = PipelineStats::default();
 
         process_host_exports(
@@ -646,6 +741,7 @@ mod tests {
             two_exports(),
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,
@@ -667,6 +763,7 @@ mod tests {
     async fn orchestrator_increments_stats() {
         let mock = mock_connector_success(vec![]);
         let (export_tx, _export_rx) = mpsc::channel(10);
+        let (export_meta_tx, _export_meta_rx) = mpsc::channel(10);
         let (result_tx, _result_rx) = mpsc::channel(10);
         let token = CancellationToken::new();
         let stats = PipelineStats::default();
@@ -676,6 +773,7 @@ mod tests {
             two_exports(),
             &mock,
             &export_tx,
+            &export_meta_tx,
             &result_tx,
             OperatingMode::Scan,
             NfsVersion::V3,

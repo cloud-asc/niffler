@@ -1562,10 +1562,6 @@ fn extensionless_config_with_aws_key_caught_by_content_fallback() {
 
 #[test]
 fn txt_file_with_password_caught_by_content_fallback() {
-    // Bug 3.3: .txt files have no file rule that relays to content scanning,
-    // but the content fallback (Bug 3.1 fix) catches them.
-    // Use "memo.txt" which doesn't match any filename rule (unlike "notes.txt"
-    // which matches TodoFiles).
     let engine = default_engine();
     let entry = file_entry("memo.txt", "/data/memo.txt", 256, 1000, 1000, 0o644);
     let content = b"password=hunter2secret1";
@@ -1628,8 +1624,6 @@ fn dotfile_without_secrets_no_false_positive() {
         "dotfile without secrets should produce no false positives, got: {findings:?}"
     );
 }
-
-// --- Bug 3.2: .map discard pattern precision ---
 
 #[test]
 fn network_map_file_not_discarded() {

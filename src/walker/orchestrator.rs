@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::classifier::RuleEngine;
 use crate::config::WalkerConfig;
-use crate::nfs::{AuthCreds, ErrorClass, NfsConnector};
+use crate::nfs::{AuthCreds, ConnectorFactory, ErrorClass};
 use crate::pipeline::{ExportMsg, FileMsg, HostConnectionPool, HostHealthRegistry, PipelineStats};
 
 use super::error::WalkerError;
@@ -17,7 +17,7 @@ use super::remote::{walk_export, walk_export_parallel};
 pub async fn run(
     mut export_rx: mpsc::Receiver<ExportMsg>,
     file_tx: mpsc::Sender<FileMsg>,
-    connector: Arc<dyn NfsConnector>,
+    connector_factory: ConnectorFactory,
     rules: Arc<RuleEngine>,
     config: &WalkerConfig,
     default_creds: AuthCreds,
@@ -26,7 +26,6 @@ pub async fn run(
     conn_pool: Arc<HostConnectionPool>,
     health: Arc<HostHealthRegistry>,
 ) -> Result<(), WalkerError> {
-    // Local mode dispatch
     if let Some(ref paths) = config.local_paths {
         return walk_local_paths(
             paths.clone(),
@@ -73,7 +72,9 @@ pub async fn run(
         };
 
         let file_tx = file_tx.clone();
-        let connector = Arc::clone(&connector);
+        // Select the connector matching this export's protocol version (v3 MOUNT
+        // exports vs v4 pseudo-fs exports can coexist in one scan).
+        let connector = connector_factory.get(export.nfs_version);
         let rules = Arc::clone(&rules);
         let creds = default_creds.clone();
         let token = token.clone();
@@ -207,7 +208,8 @@ mod tests {
     use crate::nfs::connector::MockNfsConnector;
     use crate::nfs::ops::MockNfsOps;
     use crate::nfs::{
-        DirEntry, ExportAccessOptions, NfsAttrs, NfsError, NfsFh, NfsFileType, NfsVersion,
+        DirEntry, ExportAccessOptions, NfsAttrs, NfsConnector, NfsError, NfsFh, NfsFileType,
+        NfsVersion,
     };
     use crate::pipeline::{HostConnectionPool, HostHealthRegistry};
 
@@ -271,6 +273,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 2,
@@ -288,7 +291,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -320,6 +323,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 2,
@@ -340,7 +344,7 @@ mod tests {
             run(
                 export_rx,
                 file_tx,
-                connector,
+                ConnectorFactory::uniform(connector),
                 rules,
                 &config,
                 AuthCreds::root(),
@@ -395,6 +399,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 0, // No retries — test orchestrator error resilience
@@ -412,7 +417,7 @@ mod tests {
         let result = run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -449,6 +454,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: Some(vec![tmp.path().to_path_buf()]),
             max_connections_per_host: 8,
             walk_retries: 2,
@@ -466,7 +472,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -518,6 +524,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 2,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 2,
@@ -535,7 +542,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -591,6 +598,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 10,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 2,
             walk_retries: 2,
@@ -608,7 +616,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -650,6 +658,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 2,
@@ -667,7 +676,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -706,6 +715,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 0,
@@ -723,7 +733,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),
@@ -762,6 +772,7 @@ mod tests {
         let config = WalkerConfig {
             walker_tasks: 20,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 8,
             walk_retries: 0,
@@ -780,7 +791,7 @@ mod tests {
         run(
             export_rx,
             file_tx,
-            connector,
+            ConnectorFactory::uniform(connector),
             rules,
             &config,
             AuthCreds::root(),

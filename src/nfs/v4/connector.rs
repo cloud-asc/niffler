@@ -20,19 +20,35 @@ use super::ops::{Nfs4Ops, path_to_nfsfh};
 ///
 /// Implements `NfsConnector` (Send + Sync). Each call to `connect()` creates
 /// an independent libnfs context with the specified credentials.
-#[derive(Default)]
-pub struct Nfs4Connector;
+pub struct Nfs4Connector {
+    max_dir_entries: usize,
+}
+
+impl Default for Nfs4Connector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Nfs4Connector {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            max_dir_entries: crate::nfs::ops::DEFAULT_MAX_DIR_ENTRIES,
+        }
+    }
+
+    /// Set the per-directory entry cap applied during `readdirplus` (0 = unlimited).
+    #[must_use]
+    pub fn with_max_dir_entries(mut self, max_dir_entries: usize) -> Self {
+        self.max_dir_entries = max_dir_entries;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl NfsConnector for Nfs4Connector {
-    // Bug 6.2: Wrap all FFI calls in connect() inside spawn_blocking to avoid
+    // Wrap all FFI calls in connect() inside spawn_blocking to avoid
     // blocking the tokio async runtime with synchronous libnfs network I/O.
     async fn connect(
         &self,
@@ -43,12 +59,12 @@ impl NfsConnector for Nfs4Connector {
         let host = host.to_string();
         let export = export.to_string();
         let creds = creds.clone();
+        let max_dir_entries = self.max_dir_entries;
 
         tokio::task::spawn_blocking(move || {
             let mut ctx = LibnfsContext::new()?;
             let ptr = ctx.as_ptr();
 
-            // Force NFSv4 protocol
             // SAFETY: ptr is a valid, non-null libnfs context from LibnfsContext::new().
             unsafe {
                 nfs_set_version(ptr, 4);
@@ -85,7 +101,7 @@ impl NfsConnector for Nfs4Connector {
             // Root file handle is "/" (root of the mounted export)
             let root_fh = path_to_nfsfh("/");
 
-            Ok(Box::new(Nfs4Ops::new(ctx, root_fh)) as Box<dyn NfsOps>)
+            Ok(Box::new(Nfs4Ops::new(ctx, root_fh, max_dir_entries)) as Box<dyn NfsOps>)
         })
         .await
         .map_err(|e| {

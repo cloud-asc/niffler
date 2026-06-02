@@ -4,6 +4,9 @@
 {% for e in exports %}
 <div class="export-item">
     <span class="export-path">{{ e.export_path }}</span>
+    {% if let Some(v) = e.nfs_version %}<span class="export-meta">{{ v }}</span>{% endif %}
+    {% for m in e.misconfigs %}<span class="misconfig-badge misconfig-{{ m }}">{{ m }}</span>{% endfor %}
+    {% if let Some(a) = e.allowed_hosts %}<span class="export-meta" title="allowed hosts">{{ a }}</span>{% endif %}
     <span class="export-bar" style="width: {{ e.bar_pct }}%"></span>
     <span class="export-count">{{ e.count }} finding{% if e.count != 1 %}s{% endif %}</span>
 </div>

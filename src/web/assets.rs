@@ -52,17 +52,23 @@ mod tests {
     fn test_css_contains_design_tokens() {
         let file = StaticAssets::get("css/niffler.css").expect("CSS must exist");
         let css = std::str::from_utf8(&file.data).expect("CSS must be valid UTF-8");
+        assert!(css.contains("--bg:"), "CSS must define --bg token");
         assert!(
-            css.contains("--bg-void"),
-            "CSS must contain --bg-void token"
+            css.contains("--surface:"),
+            "CSS must define --surface token"
         );
+        assert!(css.contains("--accent:"), "CSS must define --accent token");
         assert!(
-            css.contains("--sev-black"),
+            css.contains("--sev-black:"),
             "CSS must contain --sev-black token"
         );
         assert!(
-            css.contains("--brand-gold"),
-            "CSS must contain --brand-gold token"
+            css.contains("--sev-green:"),
+            "CSS must contain --sev-green token"
+        );
+        assert!(
+            css.contains("[data-theme=\"light\"]"),
+            "CSS must define a light theme"
         );
     }
 

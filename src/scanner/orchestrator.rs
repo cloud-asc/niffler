@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::classifier::RuleEngine;
 use crate::config::{OperatingMode, ScannerConfig};
-use crate::nfs::{AuthStrategy, NfsConnector};
+use crate::nfs::{AuthStrategy, ConnectorFactory};
 use crate::pipeline::{FileMsg, HostConnectionPool, HostHealthRegistry, PipelineStats, ResultMsg};
 
 use super::error::ScannerError;
@@ -19,7 +19,7 @@ pub async fn run(
     mut file_rx: mpsc::Receiver<FileMsg>,
     result_tx: mpsc::Sender<ResultMsg>,
     rules: Arc<RuleEngine>,
-    connector: Arc<dyn NfsConnector>,
+    connector_factory: ConnectorFactory,
     auth: AuthStrategy,
     config: &ScannerConfig,
     mode: OperatingMode,
@@ -50,7 +50,6 @@ pub async fn run(
             _ = token.cancelled() => break,
         };
 
-        // Skip hosts in cooldown (circuit breaker)
         if health.is_in_cooldown(&msg.host) {
             continue;
         }
@@ -63,7 +62,8 @@ pub async fn run(
         };
 
         let rules = Arc::clone(&rules);
-        let connector = Arc::clone(&connector);
+        // Read content with a connector matching the file's export version.
+        let connector = connector_factory.get(msg.nfs_version);
         let auth = auth.clone();
         let result_tx = result_tx.clone();
         let stats = Arc::clone(&stats);
@@ -78,7 +78,6 @@ pub async fn run(
         join_set.spawn(async move {
             let _permit = permit;
 
-            // Acquire per-host connection permit (with timeout)
             let host_sem = conn_pool.get_semaphore(&msg.host);
             let Ok(Ok(_host_permit)) = tokio::time::timeout(nfs_timeout, host_sem.acquire()).await
             else {
@@ -143,7 +142,6 @@ pub async fn run(
         });
     }
 
-    // Drain spawned tasks, abort on cancellation
     loop {
         tokio::select! {
             result = join_set.join_next() => {
@@ -172,7 +170,7 @@ mod tests {
     };
     use crate::nfs::connector::MockNfsConnector;
     use crate::nfs::ops::MockNfsOps;
-    use crate::nfs::{AuthCreds, NfsAttrs, NfsError, NfsFh, NfsFileType, ReadResult};
+    use crate::nfs::{AuthCreds, NfsAttrs, NfsConnector, NfsError, NfsFh, NfsFileType, ReadResult};
     use crate::pipeline::FileReader;
 
     use super::*;
@@ -222,6 +220,7 @@ mod tests {
                 host: "testhost".into(),
                 export: "/data".into(),
             },
+            nfs_version: crate::nfs::NfsVersion::V3,
             harvested_uids: vec![],
         }
     }
@@ -296,7 +295,7 @@ mod tests {
             file_rx,
             result_tx,
             engine,
-            connector,
+            ConnectorFactory::uniform(connector),
             auth(),
             &config,
             OperatingMode::Scan,
@@ -338,7 +337,7 @@ mod tests {
                 file_rx,
                 result_tx,
                 engine,
-                connector,
+                ConnectorFactory::uniform(connector),
                 auth(),
                 &config,
                 OperatingMode::Scan,
@@ -407,7 +406,7 @@ mod tests {
             file_rx,
             result_tx,
             engine,
-            connector,
+            ConnectorFactory::uniform(connector),
             auth(),
             &config,
             OperatingMode::Scan,
@@ -455,7 +454,7 @@ mod tests {
             file_rx,
             result_tx,
             engine,
-            connector,
+            ConnectorFactory::uniform(connector),
             auth(),
             &config,
             OperatingMode::Scan,
@@ -498,7 +497,7 @@ mod tests {
             file_rx,
             result_tx,
             engine,
-            connector,
+            ConnectorFactory::uniform(connector),
             auth(),
             &config,
             OperatingMode::Scan,

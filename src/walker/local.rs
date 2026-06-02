@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 use crate::classifier::RuleEngine;
-use crate::nfs::{NfsAttrs, NfsFh};
+use crate::nfs::{NfsAttrs, NfsFh, NfsVersion};
 use crate::pipeline::{FileMsg, FileReader, PipelineStats};
 
 use super::error::WalkerError;
@@ -122,11 +122,12 @@ pub(crate) async fn walk_local_paths(
                         reader: FileReader::Local {
                             path: full_path.clone(),
                         },
+                        // Local reads don't use NFS; version is unused here.
+                        nfs_version: NfsVersion::V3,
                         harvested_uids: vec![],
                     })
                     .is_err()
                 {
-                    // Channel closed — receiver dropped.
                     return Err(WalkerError::ChannelClosed);
                 }
                 stats.inc_files_discovered();
@@ -525,9 +526,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_walker_continues_on_io_error() {
-        // Bug 5.1 regression test: IO errors on individual entries should not
-        // abort the entire walk. We can't easily inject walkdir errors, but we
-        // verify that creating a permission-denied directory doesn't crash.
+        // IO errors on individual entries should not abort the entire walk.
+        // We can't easily inject walkdir errors, but we verify that creating a
+        // permission-denied directory doesn't crash.
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("good.txt"), "data").unwrap();
 

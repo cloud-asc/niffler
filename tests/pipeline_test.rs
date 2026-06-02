@@ -6,14 +6,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use niffler::config::OperatingMode;
-use niffler::nfs::NfsConnector;
+use niffler::nfs::ConnectorFactory;
 use niffler::nfs::connector::MockNfsConnector;
 use niffler::pipeline::run_pipeline;
 use tokio_util::sync::CancellationToken;
 
-/// Create a mock connector that is never actually called (local paths mode).
-fn placeholder_connector() -> Arc<dyn NfsConnector> {
-    Arc::new(MockNfsConnector::new())
+/// Create a connector factory whose mock is never actually called (local paths mode).
+fn placeholder_connector() -> ConnectorFactory {
+    ConnectorFactory::uniform(Arc::new(MockNfsConnector::new()))
 }
 
 /// Create a test config with local paths pointing to a temp directory.
@@ -47,7 +47,12 @@ async fn pipeline_scan_mode_end_to_end() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -75,7 +80,12 @@ async fn pipeline_recon_mode_skips_walker_and_scanner() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -110,7 +120,12 @@ async fn pipeline_enum_mode_skips_content_read() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -145,7 +160,12 @@ async fn pipeline_stats_accuracy() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -185,7 +205,12 @@ async fn pipeline_error_resilience() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -214,7 +239,12 @@ async fn pipeline_graceful_shutdown_on_cancellation() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -243,7 +273,12 @@ async fn pipeline_channel_backpressure() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(15),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -264,7 +299,12 @@ async fn pipeline_empty_targets() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -304,7 +344,12 @@ async fn pipeline_all_triage_levels_in_output() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -330,7 +375,12 @@ async fn pipeline_errors_when_all_targets_excluded() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 
@@ -363,7 +413,12 @@ async fn pipeline_binary_file_skips_text_rules() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        run_pipeline(config, placeholder_connector(), Some(token), None),
+        run_pipeline(
+            config,
+            placeholder_connector(),
+            Some(token),
+            niffler::tui::ReporterHandle::null(),
+        ),
     )
     .await;
 

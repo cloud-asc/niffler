@@ -1,8 +1,9 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Notify};
+use dashmap::DashMap;
+use tokio::sync::Notify;
 
 use crate::nfs::{AuthCreds, NfsConnector, NfsFh, NfsOps};
 
@@ -22,7 +23,7 @@ struct KeyPool {
 }
 
 pub struct SharedConnectionPool {
-    pools: Mutex<HashMap<PoolKey, KeyPool>>,
+    pools: DashMap<PoolKey, Arc<Mutex<KeyPool>>>,
     max_idle_per_key: usize,
     max_total_per_key: usize,
     connect_timeout: Duration,
@@ -64,19 +65,10 @@ impl CheckedOut {
 
 impl Drop for CheckedOut {
     fn drop(&mut self) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let key = self.key.clone();
-        let pool = Arc::clone(&self.pool);
         if let Some(ops) = self.ops.take() {
-            handle.spawn(async move {
-                pool.return_connection(key, ops).await;
-            });
+            self.pool.return_connection(self.key.clone(), ops);
         } else {
-            handle.spawn(async move {
-                pool.record_poison(&key).await;
-            });
+            self.pool.record_poison(&self.key);
         }
     }
 }
@@ -90,7 +82,7 @@ impl SharedConnectionPool {
         max_idle_age: Duration,
     ) -> Self {
         Self {
-            pools: Mutex::new(HashMap::new()),
+            pools: DashMap::new(),
             max_idle_per_key,
             max_total_per_key,
             connect_timeout,
@@ -108,91 +100,114 @@ impl SharedConnectionPool {
     ) -> Result<CheckedOut, ScannerError> {
         let key: PoolKey = (host.into(), export.into(), creds.uid, creds.gid);
 
+        enum Step {
+            Reuse(PoolEntry, bool),
+            Connect,
+            Wait(Arc<Notify>),
+        }
+
         loop {
-            let mut pools = self.pools.lock().await;
-            let kp = pools.entry(key.clone()).or_insert_with(|| KeyPool {
-                idle: VecDeque::new(),
-                outstanding: 0,
-                waiters: Arc::new(Notify::new()),
-            });
+            let kp_arc = self
+                .pools
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(KeyPool {
+                        idle: VecDeque::new(),
+                        outstanding: 0,
+                        waiters: Arc::new(Notify::new()),
+                    }))
+                })
+                .clone();
 
-            let now = Instant::now();
-            while kp
-                .idle
-                .front()
-                .is_some_and(|e| now.duration_since(e.last_used) > self.max_idle_age)
-            {
-                kp.idle.pop_front();
-            }
-
-            if let Some(entry) = kp.idle.pop_back() {
-                kp.outstanding += 1;
-                let is_fresh = now.duration_since(entry.last_used) < self.health_check_age;
-                drop(pools);
-
-                let mut ops = entry.ops;
-                if is_fresh {
-                    return Ok(CheckedOut {
-                        ops: Some(ops),
-                        key,
-                        pool: Arc::clone(self),
-                    });
-                }
-
-                let root = ops.root_handle().clone();
-                match tokio::time::timeout(Duration::from_secs(2), ops.getattr(&root)).await {
-                    Ok(Ok(_)) => {
-                        return Ok(CheckedOut {
-                            ops: Some(ops),
-                            key,
-                            pool: Arc::clone(self),
-                        });
-                    }
-                    _ => {
-                        self.decrement_outstanding(&key).await;
-                        continue;
-                    }
-                }
-            }
-
-            if kp.outstanding < self.max_total_per_key {
-                kp.outstanding += 1;
-                drop(pools);
-
-                match tokio::time::timeout(
-                    self.connect_timeout,
-                    connector.connect(host, export, creds),
-                )
-                .await
+            let step = {
+                let mut kp = kp_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = Instant::now();
+                while kp
+                    .idle
+                    .front()
+                    .is_some_and(|e| now.duration_since(e.last_used) > self.max_idle_age)
                 {
-                    Ok(Ok(ops)) => {
+                    kp.idle.pop_front();
+                }
+
+                if let Some(entry) = kp.idle.pop_back() {
+                    kp.outstanding += 1;
+                    let is_fresh = now.duration_since(entry.last_used) < self.health_check_age;
+                    Step::Reuse(entry, is_fresh)
+                } else if kp.outstanding < self.max_total_per_key {
+                    kp.outstanding += 1;
+                    Step::Connect
+                } else {
+                    Step::Wait(Arc::clone(&kp.waiters))
+                }
+            };
+
+            match step {
+                Step::Reuse(entry, is_fresh) => {
+                    let mut ops = entry.ops;
+                    if is_fresh {
                         return Ok(CheckedOut {
                             ops: Some(ops),
                             key,
                             pool: Arc::clone(self),
                         });
                     }
-                    Ok(Err(e)) => {
-                        self.decrement_outstanding(&key).await;
-                        return Err(ScannerError::from(e));
-                    }
-                    Err(_elapsed) => {
-                        self.decrement_outstanding(&key).await;
-                        return Err(ScannerError::Timeout(format!("connect to {host}:{export}")));
+                    let root = ops.root_handle().clone();
+                    match tokio::time::timeout(Duration::from_secs(2), ops.getattr(&root)).await {
+                        Ok(Ok(_)) => {
+                            return Ok(CheckedOut {
+                                ops: Some(ops),
+                                key,
+                                pool: Arc::clone(self),
+                            });
+                        }
+                        _ => {
+                            self.decrement_outstanding(&key);
+                            continue;
+                        }
                     }
                 }
+                Step::Connect => {
+                    match tokio::time::timeout(
+                        self.connect_timeout,
+                        connector.connect(host, export, creds),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ops)) => {
+                            return Ok(CheckedOut {
+                                ops: Some(ops),
+                                key,
+                                pool: Arc::clone(self),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            self.decrement_outstanding(&key);
+                            return Err(ScannerError::from(e));
+                        }
+                        Err(_elapsed) => {
+                            self.decrement_outstanding(&key);
+                            return Err(ScannerError::Timeout(format!(
+                                "connect to {host}:{export}"
+                            )));
+                        }
+                    }
+                }
+                Step::Wait(notify) => {
+                    notify.notified().await;
+                }
             }
-
-            let notify = Arc::clone(&kp.waiters);
-            let notified = notify.notified();
-            drop(pools);
-            notified.await;
         }
     }
 
-    async fn return_connection(&self, key: PoolKey, ops: Box<dyn NfsOps>) {
-        let mut pools = self.pools.lock().await;
-        if let Some(kp) = pools.get_mut(&key) {
+    fn with_key_pool<R>(&self, key: &PoolKey, f: impl FnOnce(&mut KeyPool) -> R) -> Option<R> {
+        let kp_arc = self.pools.get(key).map(|r| Arc::clone(&r))?;
+        let mut kp = kp_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(f(&mut kp))
+    }
+
+    fn return_connection(&self, key: PoolKey, ops: Box<dyn NfsOps>) {
+        self.with_key_pool(&key, |kp| {
             kp.outstanding = kp.outstanding.saturating_sub(1);
             if kp.idle.len() < self.max_idle_per_key {
                 kp.idle.push_back(PoolEntry {
@@ -201,23 +216,21 @@ impl SharedConnectionPool {
                 });
             }
             kp.waiters.notify_one();
-        }
+        });
     }
 
-    async fn record_poison(&self, key: &PoolKey) {
-        let mut pools = self.pools.lock().await;
-        if let Some(kp) = pools.get_mut(key) {
+    fn record_poison(&self, key: &PoolKey) {
+        self.with_key_pool(key, |kp| {
             kp.outstanding = kp.outstanding.saturating_sub(1);
             kp.waiters.notify_one();
-        }
+        });
     }
 
-    async fn decrement_outstanding(&self, key: &PoolKey) {
-        let mut pools = self.pools.lock().await;
-        if let Some(kp) = pools.get_mut(key) {
+    fn decrement_outstanding(&self, key: &PoolKey) {
+        self.with_key_pool(key, |kp| {
             kp.outstanding = kp.outstanding.saturating_sub(1);
             kp.waiters.notify_one();
-        }
+        });
     }
 }
 

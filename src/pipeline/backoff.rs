@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Exponential backoff with full jitter.
 ///
-/// Formula: min(max_delay, base * 2^attempt) + uniform_random(0, base)
+/// Formula: uniform_random(0, min(max_delay, base * 2^attempt))
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub base_delay: Duration,
@@ -28,12 +28,7 @@ impl RetryPolicy {
         let exp_ms = base_ms.saturating_mul(1u64 << attempt.min(30));
         let max_ms = self.max_delay.as_millis() as u64;
         let capped = exp_ms.min(max_ms);
-        let jitter = if base_ms > 0 {
-            fastrand::u64(0..=base_ms)
-        } else {
-            0
-        };
-        Duration::from_millis(capped + jitter)
+        Duration::from_millis(fastrand::u64(0..=capped))
     }
 
     pub async fn backoff_or_cancel(
@@ -64,19 +59,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delay_increases_exponentially() {
+    fn delay_window_grows_with_attempt() {
         let policy = RetryPolicy::new(Duration::from_millis(100), Duration::from_secs(60), 5);
-        let d0 = policy.delay_for_attempt(0);
-        let d2 = policy.delay_for_attempt(2);
-        assert!(d0.as_millis() <= 200);
-        assert!(d2.as_millis() >= 400);
+        for _ in 0..200 {
+            assert!(policy.delay_for_attempt(0).as_millis() <= 100);
+            assert!(policy.delay_for_attempt(2).as_millis() <= 400);
+        }
     }
 
     #[test]
     fn delay_capped_at_max() {
         let policy = RetryPolicy::new(Duration::from_millis(1000), Duration::from_secs(5), 10);
-        let d = policy.delay_for_attempt(20);
-        assert!(d.as_millis() <= 6000);
+        for _ in 0..200 {
+            assert!(policy.delay_for_attempt(20).as_millis() <= 5000);
+        }
+    }
+
+    #[test]
+    fn full_jitter_stays_within_capped_window() {
+        let policy = RetryPolicy::new(Duration::from_millis(100), Duration::from_secs(60), 5);
+        let capped = 3200u128;
+        let mut min_seen = u128::MAX;
+        let mut max_seen = 0u128;
+        for _ in 0..2000 {
+            let d = policy.delay_for_attempt(5).as_millis();
+            assert!(d <= capped, "delay {d} exceeds capped window {capped}");
+            min_seen = min_seen.min(d);
+            max_seen = max_seen.max(d);
+        }
+        assert!(
+            min_seen < capped / 4,
+            "min {min_seen} not near 0 — jitter not full"
+        );
+        assert!(max_seen > capped * 3 / 4, "max {max_seen} not near capped");
     }
 
     #[test]

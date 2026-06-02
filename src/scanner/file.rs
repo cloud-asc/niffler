@@ -31,7 +31,6 @@ pub(crate) async fn read_with_uid_cycling(
     nfs_timeout: Duration,
     chunk_size: u32,
 ) -> Result<Vec<u8>, ScannerError> {
-    // 1. Try primary credentials
     let mut conn = pool
         .checkout(connector, host, export, &auth.primary)
         .await?;
@@ -56,7 +55,7 @@ pub(crate) async fn read_with_uid_cycling(
         Err(e) => return Err(e),
     }
 
-    // 2. Try owner UID (stat-guided)
+    // Owner UID is stat-guided from the file's attrs.
     let owner_creds = AuthCreds::new(attrs.uid, attrs.gid);
     if owner_creds != auth.primary {
         let mut conn = pool.checkout(connector, host, export, &owner_creds).await?;
@@ -82,7 +81,7 @@ pub(crate) async fn read_with_uid_cycling(
         }
     }
 
-    // 3. Cycle harvested UIDs (count unique attempts, not list position)
+    // Count unique attempts, not list position, so skipped duplicates don't burn the budget.
     let mut unique_attempts = 0usize;
     for creds in &auth.harvested {
         if *creds == auth.primary || *creds == owner_creds {
@@ -116,7 +115,6 @@ pub(crate) async fn read_with_uid_cycling(
         }
     }
 
-    // 4. All attempts exhausted
     Err(ScannerError::AllUidsFailed(fh.clone()))
 }
 
@@ -139,6 +137,16 @@ fn file_entry_from_msg(msg: &FileMsg) -> FileEntry {
         gid: msg.attrs.gid,
         mode: msg.attrs.mode,
     }
+}
+
+/// File-name rule findings only (no content). Used when content can't be read
+/// so a file matched purely by name/metadata is still reported.
+fn name_only_results(rules: &RuleEngine, entry: &FileEntry, msg: &FileMsg) -> Vec<ResultMsg> {
+    rules
+        .evaluate_file(entry, None)
+        .iter()
+        .map(|f| finding_to_result(f, msg))
+        .collect()
 }
 
 fn finding_to_result(finding: &Finding, msg: &FileMsg) -> ResultMsg {
@@ -180,18 +188,15 @@ pub(crate) async fn scan_file(
     let entry = file_entry_from_msg(msg);
     let mut results = Vec::new();
 
-    // 1. Evaluate file-name rules (no content yet)
-    let name_findings = rules.evaluate_file(&entry, None);
-    for finding in &name_findings {
-        results.push(finding_to_result(finding, msg));
-    }
-
-    // 2. Mode check — enumerate mode skips content
+    // Enumerate mode skips content: evaluate file-name rules only and return.
     if !mode.runs_content_scan() {
+        for finding in &rules.evaluate_file(&entry, None) {
+            results.push(finding_to_result(finding, msg));
+        }
         return results;
     }
 
-    // 3. Read file content — merge per-file harvested UIDs into auth strategy
+    // Read file content — merge per-file harvested UIDs into auth strategy
     let file_auth;
     let effective_auth = if !msg.harvested_uids.is_empty() {
         file_auth = AuthStrategy {
@@ -252,7 +257,7 @@ pub(crate) async fn scan_file(
                                 e
                             );
                             if policy.backoff_or_cancel(attempt, token).await.is_err() {
-                                return results;
+                                return name_only_results(rules, &entry, msg);
                             }
                             continue;
                         }
@@ -267,7 +272,7 @@ pub(crate) async fn scan_file(
                             _ => stats.errors_transient.fetch_add(1, Ordering::Relaxed),
                         };
                         health.record_error(host);
-                        return results;
+                        return name_only_results(rules, &entry, msg);
                     }
                 }
             }
@@ -277,7 +282,7 @@ pub(crate) async fn scan_file(
         FileReader::Local { path } => {
             match read_local_for_scan(path.clone(), max_scan_size).await {
                 Ok(data) => data,
-                Err(_) => return results,
+                Err(_) => return name_only_results(rules, &entry, msg),
             }
         }
     };
@@ -290,54 +295,50 @@ pub(crate) async fn scan_file(
         stats.files_skipped_size.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 4. Binary detection (invariant #8 — tracked for stats)
+    // Binary detection is tracked for stats but does not skip key inspection below.
     let is_binary = is_likely_binary(&data);
     if is_binary {
         stats.files_skipped_binary.fetch_add(1, Ordering::Relaxed);
     }
 
-    // 5. Evaluate content rules (engine handles binary detection internally)
-    // Re-evaluate with content — this re-runs file rules but also follows relay chains to content rules.
-    // Deduplicate by rule_name: safe because RuleEngine::compile() enforces unique names,
-    // so the same rule always matches identically for a given input.
-    let name_rule_names: Vec<String> = name_findings.iter().map(|f| f.rule_name.clone()).collect();
-    let content_findings = rules.evaluate_file(&entry, Some(&data));
+    // Single evaluation pass: evaluate_file already runs file-name rules, follows
+    // relay chains to content rules, and applies the content fallback, so name +
+    // content findings are emitted together — no separate name-only pass needed.
+    let findings = rules.evaluate_file(&entry, Some(&data));
     let text = String::from_utf8_lossy(&data);
-    for finding in &content_findings {
-        if name_rule_names.contains(&finding.rule_name) {
-            continue; // Already emitted from name-only pass
-        }
+    for finding in &findings {
         let mut result = finding_to_result(finding, msg);
-        let is_bytes_rule = rules
-            .match_location(&finding.rule_name)
-            .is_some_and(|loc| *loc == MatchLocation::FileContentAsBytes);
-        if is_bytes_rule {
-            let ctx_bytes = rules.context_bytes(&finding.rule_name).unwrap_or(200);
-            if let Some((start, end)) = rules
-                .matcher(&finding.rule_name)
-                .and_then(|m| m.find_match_bytes(&data))
-            {
-                result.context = Some(extract_context_bytes(&data, start, end, ctx_bytes));
-            } else {
-                let context_len = data.len().min(200);
-                result.context = Some(extract_context_bytes(&data, 0, context_len, 0));
+        match rules.match_location(&finding.rule_name) {
+            Some(MatchLocation::FileContentAsBytes) => {
+                let ctx_bytes = rules.context_bytes(&finding.rule_name).unwrap_or(200);
+                if let Some((start, end)) = rules
+                    .matcher(&finding.rule_name)
+                    .and_then(|m| m.find_match_bytes(&data))
+                {
+                    result.context = Some(extract_context_bytes(&data, start, end, ctx_bytes));
+                } else {
+                    let context_len = data.len().min(200);
+                    result.context = Some(extract_context_bytes(&data, 0, context_len, 0));
+                }
             }
-        } else if !text.is_empty() {
-            let ctx_bytes = rules.context_bytes(&finding.rule_name).unwrap_or(200);
-            if let Some((start, end)) = rules
-                .matcher(&finding.rule_name)
-                .and_then(|m| m.find_match(&text))
-            {
-                result.context = Some(extract_context(&text, start, end, ctx_bytes));
-            } else {
-                let context_len = text.len().min(200);
-                result.context = Some(extract_context(&text, 0, context_len, 0));
+            Some(MatchLocation::FileContentAsString) if !text.is_empty() => {
+                let ctx_bytes = rules.context_bytes(&finding.rule_name).unwrap_or(200);
+                if let Some((start, end)) = rules
+                    .matcher(&finding.rule_name)
+                    .and_then(|m| m.find_match(&text))
+                {
+                    result.context = Some(extract_context(&text, start, end, ctx_bytes));
+                } else {
+                    let context_len = text.len().min(200);
+                    result.context = Some(extract_context(&text, 0, context_len, 0));
+                }
             }
+            _ => {}
         }
         results.push(result);
     }
 
-    // 6. Key inspection (always, even for binary)
+    // Key inspection runs always, even for binary content.
     if let Some(key_finding) = inspect_key_material(&data) {
         let triage = if key_finding.is_encrypted {
             Triage::Red
@@ -880,6 +881,7 @@ mod tests {
                 host: "testhost".into(),
                 export: "/data".into(),
             },
+            nfs_version: crate::nfs::NfsVersion::V3,
             harvested_uids: vec![],
         }
     }
@@ -899,6 +901,7 @@ mod tests {
                 mtime: 1700000000,
             },
             reader: FileReader::Local { path },
+            nfs_version: crate::nfs::NfsVersion::V3,
             harvested_uids: vec![],
         }
     }

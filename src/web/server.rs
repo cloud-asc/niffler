@@ -16,13 +16,11 @@ pub struct AppState {
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        // Page routes
         .route("/", get(handlers::root_redirect))
         .route("/dashboard", get(handlers::dashboard))
         .route("/findings", get(handlers::findings))
         .route("/hosts", get(handlers::hosts))
         .route("/scans", get(handlers::scans))
-        // HTMX API routes
         .route("/api/findings", get(handlers::api_findings))
         .route("/api/findings/{id}", get(handlers::api_finding_detail))
         .route("/api/findings/{id}/star", post(handlers::api_finding_star))
@@ -30,12 +28,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/findings/{id}/review",
             post(handlers::api_finding_review),
         )
+        .route("/api/findings/bulk", post(handlers::api_findings_bulk))
+        .route("/api/findings/{id}/note", post(handlers::api_finding_note))
         .route("/api/hosts/{host}/exports", get(handlers::api_host_exports))
         .route("/api/stats", get(handlers::api_stats))
-        // Export routes
         .route("/api/export/csv", get(handlers::api_export_csv))
         .route("/api/export/json", get(handlers::api_export_json))
-        // Static assets
+        .route("/api/export/markdown", get(handlers::api_export_markdown))
         .route("/static/{*path}", get(static_handler))
         .with_state(state)
 }
@@ -127,7 +126,6 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
 
-        // Severity stat cards present
         assert!(
             html.contains("sev-black"),
             "should have black severity card"
@@ -209,7 +207,6 @@ mod tests {
             .unwrap();
         let html = std::str::from_utf8(&body).unwrap();
 
-        // Should render without error and show zero counts
         assert!(
             html.contains("sev-black"),
             "should have severity cards even when empty"
@@ -246,7 +243,25 @@ mod tests {
         assert!(html.contains("Scans"), "should have Scans nav link");
     }
 
-    // ── Step 9: Findings Table + Filters ───────────────────
+    #[tokio::test]
+    async fn test_dashboard_shows_latest_scan() {
+        let app = test_app_with_data().await;
+        let req = Request::builder()
+            .uri("/dashboard")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("latest-scan"),
+            "dashboard shows the latest-scan card"
+        );
+        assert!(html.contains("Latest scan"), "card has a header");
+    }
 
     #[tokio::test]
     async fn test_findings_page_renders() {
@@ -517,8 +532,6 @@ mod tests {
         );
     }
 
-    // ── Step 10: Finding Detail + Star/Review API ─────────────
-
     #[tokio::test]
     async fn test_detail_returns_html() {
         let app = test_app_with_data().await;
@@ -611,6 +624,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detail_has_copy_buttons() {
+        let app = test_app_with_data().await;
+        let req = Request::builder()
+            .uri("/api/findings/1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("copy-btn"), "detail should have copy buttons");
+        assert!(
+            html.contains("data-copy"),
+            "copy buttons carry a data-copy value"
+        );
+    }
+
+    #[tokio::test]
     async fn test_star_toggle() {
         let app = test_app_with_data().await;
         let req = Request::builder()
@@ -700,8 +733,6 @@ mod tests {
             "button should remain interactive with hx-post"
         );
     }
-
-    // ── Step 11: Web Export (CSV + JSON) ─────────────────────
 
     #[tokio::test]
     async fn test_export_csv_returns_file() {
@@ -860,8 +891,6 @@ mod tests {
         }
     }
 
-    // ── Step 12: Hosts Page ────────────────────────────────────
-
     #[tokio::test]
     async fn test_hosts_page_renders() {
         let app = test_app_with_data().await;
@@ -1012,6 +1041,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_host_exports_shows_misconfig_badge() {
+        let (app, state) = test_app_and_state_with_data().await;
+        state
+            .db
+            .conn
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO exports (scan_id, host, export_path, nfs_version, allowed_hosts)
+                     VALUES (1, '10.0.0.1', '/exports/home', 'v3', '*')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO misconfigs (scan_id, host, export_path, kind)
+                     VALUES (1, '10.0.0.1', '/exports/home', 'possible_no_root_squash')",
+                    [],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/api/hosts/10.0.0.1/exports")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("misconfig-badge"),
+            "should render a misconfig badge"
+        );
+        assert!(
+            html.contains("possible_no_root_squash"),
+            "badge names the misconfig"
+        );
+        assert!(html.contains("/exports/home"), "lists the export");
+    }
+
+    #[tokio::test]
     async fn test_export_empty() {
         let app = test_app().await;
 
@@ -1044,8 +1115,6 @@ mod tests {
             "empty JSON export should produce no output"
         );
     }
-
-    // ── Empty-string normalization (HTMX form serialization) ────
 
     #[tokio::test]
     async fn test_findings_empty_params_returns_all() {
@@ -1129,8 +1198,6 @@ mod tests {
             "all 10 findings should be exported"
         );
     }
-
-    // ── Step 13: Scans Page ─────────────────────────────────────
 
     #[tokio::test]
     async fn test_scans_page_renders() {
@@ -1227,6 +1294,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_theme_toggle_present() {
+        let app = test_app().await;
+        let req = Request::builder()
+            .uri("/dashboard")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("data-theme"),
+            "pre-paint theme script must set data-theme"
+        );
+        assert!(
+            html.contains("id=\"theme-toggle\""),
+            "nav must contain a theme toggle button"
+        );
+        assert!(
+            html.contains("niffler-theme"),
+            "theme must persist under the niffler-theme key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bulk_star_endpoint() {
+        let (app, state) = test_app_and_state_with_data().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/findings/bulk")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("ids=1,2,3&action=star"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(!html.contains("<html"), "bulk response is a fragment");
+        assert!(html.contains("findings-row"), "fragment contains rows");
+
+        let starred = state
+            .db
+            .list_findings(&crate::web::db::FindingsQuery {
+                show: crate::web::db::ShowFilter::Starred,
+                per_page: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(starred.len(), 3, "ids 1,2,3 should be starred");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_triage_endpoint() {
+        let (app, state) = test_app_and_state_with_data().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/findings/bulk")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("ids=1,2&action=triage&bulk_triage=Black"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let f = state.db.finding_by_id(1).await.unwrap().unwrap();
+        assert_eq!(f.triage, "Black");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_review_endpoint() {
+        let (app, state) = test_app_and_state_with_data().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/findings/bulk")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("ids=1,2,3,4&action=review"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let unreviewed = state
+            .db
+            .list_findings(&crate::web::db::FindingsQuery {
+                show: crate::web::db::ShowFilter::Unreviewed,
+                per_page: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(unreviewed.len(), 6, "10 - 4 reviewed = 6 unreviewed");
+    }
+
+    #[tokio::test]
+    async fn test_save_note_endpoint() {
+        let (app, state) = test_app_and_state_with_data().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/findings/1/note")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("note=check%20this%20host"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.db.get_note(1).await.unwrap().as_deref(),
+            Some("check this host")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detail_shows_saved_note() {
+        let (app, state) = test_app_and_state_with_data().await;
+        state
+            .db
+            .set_note(1, Some("prior note".into()))
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .uri("/api/findings/1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("prior note"),
+            "detail prefills the saved note"
+        );
+        assert!(html.contains("note-input"), "detail has a note textarea");
+    }
+
+    #[tokio::test]
+    async fn test_findings_rows_have_select_checkbox() {
+        let app = test_app_with_data().await;
+        let req = Request::builder()
+            .uri("/api/findings")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("row-select"),
+            "each row has a select checkbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_markdown_returns_report() {
+        let app = test_app_with_data().await;
+        let req = Request::builder()
+            .uri("/api/export/markdown")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/markdown"),
+            "expected text/markdown, got {ct}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let md = std::str::from_utf8(&body).unwrap();
+        assert!(
+            md.contains("# Niffler Findings Report"),
+            "is a markdown report"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_selected_ids_only() {
+        let app = test_app_with_data().await;
+        let req = Request::builder()
+            .uri("/api/export/json?ids=1,2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = std::str::from_utf8(&body).unwrap();
+        let lines = txt.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(lines, 2, "ids=1,2 should export exactly 2 findings");
+    }
+
+    #[tokio::test]
     async fn api_stats_returns_json() {
         let app = test_app().await;
         let resp = app
@@ -1246,5 +1514,96 @@ mod tests {
         assert!(stats.get("total_findings").is_some());
         assert!(stats.get("total_hosts").is_some());
         assert!(stats.get("total_scans").is_some());
+    }
+
+    async fn findings_page_html(app: Router) -> String {
+        let req = Request::builder()
+            .uri("/findings")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // Regression: the full page must contain exactly one #findings-pagination.
+    // A second one (the OOB copy meant only for fragment responses) used to be
+    // emitted inside <tbody>, which the browser hoisted out, producing a
+    // duplicated pagination bar after the first htmx swap.
+    #[tokio::test]
+    async fn test_findings_page_single_pagination() {
+        let html = findings_page_html(test_app_with_data().await).await;
+        let n = html.matches(r#"id="findings-pagination""#).count();
+        assert_eq!(n, 1, "full page should have exactly one pagination element");
+        assert!(
+            html.contains("Showing"),
+            "the single pagination must be populated on initial load"
+        );
+    }
+
+    // Regression: the fragment still carries the OOB pagination so htmx can
+    // refresh the standalone bar on sort/filter/paginate.
+    #[tokio::test]
+    async fn test_findings_fragment_has_oob_pagination() {
+        let req = Request::builder()
+            .uri("/api/findings")
+            .body(Body::empty())
+            .unwrap();
+        let resp = test_app_with_data().await.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains(r#"id="findings-pagination""#));
+        assert!(
+            html.contains(r#"hx-swap-oob="true""#),
+            "fragment pagination must be an OOB swap"
+        );
+    }
+
+    // Regression: the bulk-triage Apply button must not use the htmx conditional
+    // trigger `click[document...]` — htmx 2.x symbol resolution shadows the global
+    // `document`, so the filter threw and the request never fired.
+    #[tokio::test]
+    async fn test_bulk_triage_apply_has_no_broken_trigger() {
+        let html = findings_page_html(test_app_with_data().await).await;
+        assert!(
+            !html.contains("click[document"),
+            "Apply must not use the broken conditional htmx trigger"
+        );
+    }
+
+    // Regression: sortable headers carry data-col so the client can mirror the
+    // active sort arrow after a tbody-only swap.
+    #[tokio::test]
+    async fn test_sortable_headers_have_data_col() {
+        let html = findings_page_html(test_app_with_data().await).await;
+        for col in [
+            "triage",
+            "rule_name",
+            "host",
+            "file_path",
+            "file_size",
+            "timestamp",
+        ] {
+            assert!(
+                html.contains(&format!(r#"data-col="{col}""#)),
+                "missing data-col for {col}"
+            );
+        }
+    }
+
+    // Regression: the wide findings table is wrapped in a horizontal scroller so
+    // the Actions column is reachable on narrow viewports.
+    #[tokio::test]
+    async fn test_findings_table_has_scroll_wrapper() {
+        let html = findings_page_html(test_app_with_data().await).await;
+        assert!(
+            html.contains("table-scroll"),
+            "table needs a scroll wrapper"
+        );
     }
 }

@@ -87,6 +87,7 @@ pub struct DiscoveryConfig {
 pub struct WalkerConfig {
     pub walker_tasks: usize,
     pub max_depth: usize,
+    pub max_dir_entries: usize,
     pub local_paths: Option<Vec<PathBuf>>,
     pub max_connections_per_host: usize,
     pub walk_retries: usize,
@@ -117,11 +118,12 @@ pub struct ScannerConfig {
     pub scan_retry_delay_ms: u64,
 }
 
-/// Output settings — SQLite database path and optional live console tee.
+/// Output settings — SQLite database path and how the scan presents itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
     pub db_path: PathBuf,
-    pub live: bool,
+    #[serde(default)]
+    pub display: crate::tui::DisplayMode,
     pub min_severity: Triage,
 }
 
@@ -155,7 +157,7 @@ impl NifflerConfig {
     ///
     /// Validates that at least one target source is provided unless `-z` is set.
     pub fn from_scan_args(args: ScanArgs) -> Result<Self> {
-        // Bug 2.2: validate --nfs-version early, before any config loading.
+        // Validate --nfs-version early, before any config loading.
         if let Some(v) = args.nfs_version
             && v != 3
             && v != 4
@@ -163,7 +165,7 @@ impl NifflerConfig {
             bail!("invalid --nfs-version {v}: must be 3 or 4");
         }
 
-        // Bug 2.1: if --config is provided, load the TOML file as the config.
+        // If --config is provided, the TOML file IS the config; CLI flags are ignored.
         if let Some(ref config_path) = args.config {
             let contents = std::fs::read_to_string(config_path).map_err(|e| {
                 anyhow::anyhow!(
@@ -233,6 +235,7 @@ impl NifflerConfig {
             walker: WalkerConfig {
                 walker_tasks: args.walker_tasks,
                 max_depth: args.max_depth,
+                max_dir_entries: args.max_dir_entries,
                 local_paths: args.local_path,
                 max_connections_per_host: args.max_connections_per_host,
                 walk_retries: args.walk_retries,
@@ -261,7 +264,13 @@ impl NifflerConfig {
             },
             output: OutputConfig {
                 db_path: args.output,
-                live: args.live,
+                display: if args.tui {
+                    crate::tui::DisplayMode::Tui
+                } else if args.plain {
+                    crate::tui::DisplayMode::Plain
+                } else {
+                    crate::tui::DisplayMode::Auto
+                },
                 min_severity: args.min_severity,
             },
             health: HealthConfig {
@@ -313,7 +322,7 @@ mod tests {
         let config = NifflerConfig::from_scan_args(args).unwrap();
         assert_eq!(config.mode, OperatingMode::Scan);
         assert_eq!(config.output.db_path, PathBuf::from("niffler.db"));
-        assert!(!config.output.live);
+        assert_eq!(config.output.display, crate::tui::DisplayMode::Auto);
         assert_eq!(config.scanner.max_scan_size, 1_048_576);
         assert_eq!(config.discovery.discovery_tasks, 30);
         assert_eq!(config.walker.walker_tasks, 20);
@@ -397,13 +406,13 @@ mod tests {
 
     #[test]
     fn config_toml_round_trip() {
-        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--live"]);
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--plain"]);
         let config = NifflerConfig::from_scan_args(args).unwrap();
         let toml_str = toml::to_string_pretty(&config).expect("serialize to TOML");
         let restored: NifflerConfig = toml::from_str(&toml_str).expect("deserialize from TOML");
         assert_eq!(restored.mode, config.mode);
         assert_eq!(restored.output.db_path, config.output.db_path);
-        assert_eq!(restored.output.live, config.output.live);
+        assert_eq!(restored.output.display, config.output.display);
         assert_eq!(restored.scanner.max_scan_size, config.scanner.max_scan_size);
         assert_eq!(restored.output.min_severity, config.output.min_severity);
     }
@@ -416,10 +425,8 @@ mod tests {
         let value: toml::Value = toml::from_str(&toml_str).unwrap();
         let table = value.as_table().unwrap();
 
-        // Top-level fields
         assert!(table.contains_key("mode"), "missing: mode");
 
-        // Nested fields
         let discovery = table["discovery"].as_table().unwrap();
         assert!(
             discovery.contains_key("discovery_tasks"),
@@ -442,7 +449,7 @@ mod tests {
 
         let output = table["output"].as_table().unwrap();
         assert!(output.contains_key("db_path"), "missing: db_path");
-        assert!(output.contains_key("live"), "missing: live");
+        assert!(output.contains_key("display"), "missing: display");
     }
 
     #[test]
@@ -453,7 +460,6 @@ mod tests {
         let value: toml::Value = toml::from_str(&toml_str).unwrap();
         let table = value.as_table().unwrap();
 
-        // OperatingMode serializes as lowercase string
         let mode = &table["mode"];
         assert_eq!(mode.as_str().unwrap(), "scan");
         assert!(mode.as_integer().is_none(), "mode should not be an integer");
@@ -477,7 +483,7 @@ mod tests {
             "10.0.0.1",
             "-m",
             "recon",
-            "--live",
+            "--plain",
             "-b",
             "red",
             "--uid",
@@ -500,7 +506,7 @@ mod tests {
         let restored: NifflerConfig = toml::from_str(&toml_str).expect("deserialize");
 
         assert_eq!(restored.mode, OperatingMode::Recon);
-        assert!(restored.output.live);
+        assert_eq!(restored.output.display, crate::tui::DisplayMode::Plain);
         assert_eq!(restored.output.min_severity, Triage::Red);
         assert_eq!(restored.scanner.uid, 1000);
         assert_eq!(restored.scanner.gid, 2000);
@@ -513,7 +519,6 @@ mod tests {
 
     #[test]
     fn config_round_trip_preserves_optional_fields() {
-        // Part A: None fields stay None
         let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1"]);
         let config = NifflerConfig::from_scan_args(args).unwrap();
         let toml_str = toml::to_string_pretty(&config).expect("serialize");
@@ -523,7 +528,6 @@ mod tests {
         assert!(restored.discovery.nfs_version.is_none());
         assert!(restored.walker.local_paths.is_none());
 
-        // Part B: Some fields preserved
         let args = parse_scan(&[
             "niffler",
             "scan",
@@ -556,7 +560,7 @@ mod tests {
 
         assert_eq!(restored.mode, OperatingMode::Scan);
         assert_eq!(restored.output.db_path, PathBuf::from("niffler.db"));
-        assert!(!restored.output.live);
+        assert_eq!(restored.output.display, crate::tui::DisplayMode::Auto);
         assert_eq!(restored.output.min_severity, Triage::Green);
         assert_eq!(restored.scanner.uid, 65534);
         assert_eq!(restored.scanner.gid, 65534);
@@ -568,6 +572,7 @@ mod tests {
         assert_eq!(restored.scanner.scanner_tasks, 50);
         assert!(!restored.scanner.check_subtree_bypass);
         assert_eq!(restored.walker.walker_tasks, 20);
+        assert_eq!(restored.walker.max_dir_entries, 1_000_000);
         assert_eq!(restored.walker.walk_retries, 2);
         assert_eq!(restored.walker.walk_retry_delay_ms, 500);
         assert_eq!(restored.walker.max_depth, 50);
@@ -580,12 +585,9 @@ mod tests {
         assert!(!restored.generate_config);
     }
 
-    // ── Bug 2.1: --config file loading ──────────────────────────────
-
     #[test]
     fn config_from_file_loads_valid_toml() {
-        // Generate a valid config TOML, write to tempfile, load via --config
-        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--live"]);
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--plain"]);
         let original = NifflerConfig::from_scan_args(args).unwrap();
         let toml_str = toml::to_string_pretty(&original).expect("serialize");
 
@@ -596,7 +598,7 @@ mod tests {
         let args = parse_scan(&["niffler", "scan", "-c", config_path.to_str().unwrap()]);
         let loaded = NifflerConfig::from_scan_args(args).unwrap();
         assert_eq!(loaded.mode, original.mode);
-        assert!(loaded.output.live);
+        assert_eq!(loaded.output.display, crate::tui::DisplayMode::Plain);
         assert_eq!(loaded.scanner.max_scan_size, original.scanner.max_scan_size);
         assert_eq!(
             loaded.discovery.targets.as_deref(),
@@ -639,7 +641,6 @@ mod tests {
 
     #[test]
     fn config_from_file_no_targets_errors() {
-        // A config file with no targets and generate_config = false should fail
         let args = parse_scan(&["niffler", "scan", "-z"]);
         let mut config = NifflerConfig::from_scan_args(args).unwrap();
         config.generate_config = false;
@@ -661,8 +662,6 @@ mod tests {
             "expected no-targets error, got: {err}"
         );
     }
-
-    // ── Bug 2.2: --nfs-version validation ───────────────────────────
 
     #[test]
     fn nfs_version_3_accepted() {
@@ -751,8 +750,6 @@ mod tests {
         assert!(restored.discovery.excludes.is_none());
         assert!(restored.discovery.exclude_file.is_none());
     }
-
-    // ── Bug 2.3: parse_proxy_url hostname support ───────────────────
 
     #[test]
     fn proxy_url_with_scheme_numeric() {

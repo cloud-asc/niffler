@@ -433,6 +433,7 @@ pub(crate) async fn walk_dir(
                         host: export.host.clone(),
                         export: export.export_path.clone(),
                     },
+                    nfs_version: export.nfs_version,
                     harvested_uids: export.harvested_uids.clone(),
                 })
                 .await?;

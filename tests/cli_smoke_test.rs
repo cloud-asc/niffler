@@ -29,7 +29,6 @@ fn scan_help_contains_all_flag_groups() {
         "--mode",
         "--uid",
         "--gid",
-        "--live",
         "--output",
         "--rules-dir",
         "--max-scan-size",
@@ -41,6 +40,8 @@ fn scan_help_contains_all_flag_groups() {
         "--generate-config",
         "--config",
         "--min-severity",
+        "--tui",
+        "--plain",
     ];
 
     let mut a = assert;
@@ -159,7 +160,7 @@ fn scan_creates_default_db() {
 }
 
 #[test]
-fn scan_live_flag() {
+fn scan_line_mode_emits_findings_to_stdout() {
     let data_dir = tempfile::Builder::new()
         .prefix("niffler-test-")
         .tempdir_in(env!("CARGO_MANIFEST_DIR"))
@@ -172,13 +173,13 @@ fn scan_live_flag() {
     )
     .unwrap();
 
+    // Non-TTY harness resolves to line mode, which streams findings to stdout.
     Command::cargo_bin("niffler")
         .unwrap()
         .args([
             "scan",
             "-i",
             data_dir.path().to_str().unwrap(),
-            "--live",
             "-o",
             db_file.path().to_str().unwrap(),
         ])

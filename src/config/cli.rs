@@ -104,9 +104,13 @@ pub struct ScanArgs {
     #[arg(short = 'o', long, default_value = "niffler.db")]
     pub output: PathBuf,
 
-    /// Print findings to terminal alongside database write
-    #[arg(short = 'l', long)]
-    pub live: bool,
+    /// Force the full-screen live dashboard (even without a detected TTY)
+    #[arg(long, conflicts_with = "plain")]
+    pub tui: bool,
+
+    /// Force plain line output (no dashboard); also the automatic non-TTY mode
+    #[arg(long, alias = "no-tui")]
+    pub plain: bool,
 
     /// UID for NFS AUTH_SYS credentials
     #[arg(long, default_value = "65534")]
@@ -159,6 +163,11 @@ pub struct ScanArgs {
     /// Max directory depth during tree walk
     #[arg(long, default_value = "50")]
     pub max_depth: usize,
+
+    /// Max entries read per directory (0 = unlimited) — caps client memory
+    /// against servers returning pathologically large directories
+    #[arg(long, default_value = "1000000")]
+    pub max_dir_entries: usize,
 
     /// Max concurrent directory listings per export during tree walk
     #[arg(long, default_value = "8")]
@@ -285,7 +294,6 @@ mod tests {
         assert!(!args.no_privileged_port);
         assert!(!args.generate_config);
         assert!(!args.check_subtree_bypass);
-        assert!(!args.live);
     }
 
     #[test]
@@ -333,5 +341,32 @@ mod tests {
     fn verbosity_global_after_subcommand() {
         let cli = parse(&["niffler", "scan", "-t", "10.0.0.1", "-v", "debug"]);
         assert!(matches!(cli.verbosity, Verbosity::Debug));
+    }
+
+    #[test]
+    fn display_defaults_to_auto() {
+        let args = parse_scan(&["niffler", "scan", "-t", "10.0.0.1"]);
+        assert!(!args.tui);
+        assert!(!args.plain);
+    }
+
+    #[test]
+    fn tui_and_plain_flags_parse() {
+        let a = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--tui"]);
+        assert!(a.tui);
+        let b = parse_scan(&["niffler", "scan", "-t", "10.0.0.1", "--plain"]);
+        assert!(b.plain);
+    }
+
+    #[test]
+    fn tui_and_plain_conflict() {
+        let r = Cli::try_parse_from(["niffler", "scan", "-t", "10.0.0.1", "--tui", "--plain"]);
+        assert!(r.is_err(), "--tui and --plain must conflict");
+    }
+
+    #[test]
+    fn live_flag_removed() {
+        let r = Cli::try_parse_from(["niffler", "scan", "-t", "10.0.0.1", "--live"]);
+        assert!(r.is_err(), "--live should no longer be accepted");
     }
 }

@@ -36,6 +36,11 @@ impl SqliteWriter {
         self.db.insert_findings_batch(self.scan_id, msgs).await
     }
 
+    /// Persist discovered exports + their misconfigurations for this scan.
+    pub async fn write_exports(&self, exports: &[crate::pipeline::ExportMsg]) -> Result<()> {
+        self.db.insert_exports(self.scan_id, exports.to_vec()).await
+    }
+
     /// Mark the scan as completed with final pipeline statistics.
     pub async fn finish(&self, stats: &PipelineStats) -> Result<()> {
         self.db.rebuild_fts_index().await?;
@@ -129,7 +134,6 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let writer = SqliteWriter::new(tmp.path(), &[], "scan").await.unwrap();
 
-        // Same scan + host + export + file + rule → dedup
         writer.write(&make_msg("SSHKey", "id_rsa")).await.unwrap();
         writer.write(&make_msg("SSHKey", "id_rsa")).await.unwrap();
 
@@ -164,11 +168,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_write_exports_persists_exports_and_misconfigs() {
+        use crate::nfs::{ExportAccessOptions, Misconfiguration, NfsVersion};
+        use crate::pipeline::ExportMsg;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let writer = SqliteWriter::new(tmp.path(), &["10.0.0.0/24".into()], "recon")
+            .await
+            .unwrap();
+
+        let msg = ExportMsg {
+            host: "10.0.0.5".into(),
+            export_path: "/exports/home".into(),
+            nfs_version: NfsVersion::V3,
+            access_options: ExportAccessOptions {
+                allowed_hosts: vec!["*".into()],
+            },
+            harvested_uids: vec![],
+            misconfigs: vec![
+                Misconfiguration::PossibleNoRootSquash,
+                Misconfiguration::InsecureExport,
+            ],
+        };
+
+        writer
+            .write_exports(std::slice::from_ref(&msg))
+            .await
+            .unwrap();
+        writer
+            .write_exports(std::slice::from_ref(&msg))
+            .await
+            .unwrap(); // idempotent
+
+        let recs = writer.db().export_records(None, "10.0.0.5").await.unwrap();
+        assert_eq!(recs.len(), 1, "one export persisted (deduped)");
+        assert_eq!(recs[0].nfs_version, "v3");
+        assert_eq!(recs[0].allowed_hosts.as_deref(), Some("*"));
+        assert_eq!(recs[0].misconfigs.len(), 2, "two misconfig kinds");
+        assert!(
+            recs[0]
+                .misconfigs
+                .contains(&"possible_no_root_squash".to_string())
+        );
+        assert!(recs[0].misconfigs.contains(&"insecure".to_string()));
+    }
+
+    #[tokio::test]
     async fn sqlite_writer_defers_fts_and_rebuilds_on_finish() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let writer = SqliteWriter::new(tmp.path(), &[], "scan").await.unwrap();
 
-        // FTS trigger should be disabled during scan
         let has_trigger: bool = writer
             .db()
             .conn
@@ -184,10 +233,8 @@ mod tests {
             .unwrap();
         assert!(!has_trigger, "FTS trigger should be disabled during scan");
 
-        // Insert a finding
         writer.write(&make_msg("SSHKey", "id_rsa")).await.unwrap();
 
-        // FTS search should NOT find it yet (trigger disabled)
         let results = writer
             .db()
             .list_findings(&FindingsQuery {
@@ -199,11 +246,9 @@ mod tests {
             .unwrap();
         assert!(results.is_empty(), "FTS should be empty during scan");
 
-        // Finish rebuilds FTS
         let stats = PipelineStats::default();
         writer.finish(&stats).await.unwrap();
 
-        // Now FTS search should work
         let db = crate::web::db::Database::open(tmp.path()).await.unwrap();
         let results = db
             .list_findings(&FindingsQuery {

@@ -62,6 +62,7 @@ pub fn test_config(mode: OperatingMode) -> NifflerConfig {
         walker: WalkerConfig {
             walker_tasks: 2,
             max_depth: 50,
+            max_dir_entries: 1_000_000,
             local_paths: None,
             max_connections_per_host: 4,
             walk_retries: 2,
@@ -90,7 +91,7 @@ pub fn test_config(mode: OperatingMode) -> NifflerConfig {
         },
         output: OutputConfig {
             db_path: std::env::temp_dir().join("niffler_integration_test.db"),
-            live: false,
+            display: niffler::tui::DisplayMode::Auto,
             min_severity: Triage::Green,
         },
         health: niffler::config::HealthConfig {
@@ -192,6 +193,7 @@ pub fn make_file_msg(host: &str, export: &str, path: &str, attrs: NfsAttrs) -> F
             host: host.into(),
             export: export.into(),
         },
+        nfs_version: NfsVersion::V3,
         harvested_uids: vec![],
     }
 }

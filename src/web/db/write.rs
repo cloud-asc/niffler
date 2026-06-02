@@ -143,6 +143,91 @@ impl Database {
         Ok(())
     }
 
+    /// Override the `triage` column for every id (operator reclassification),
+    /// in one transaction. Rejects any value outside the four valid tiers.
+    /// Returns the number of ids processed. Empty input is a no-op.
+    pub async fn bulk_set_triage(&self, ids: Vec<i64>, triage: String) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if !matches!(triage.as_str(), "Black" | "Red" | "Yellow" | "Green") {
+            anyhow::bail!("invalid triage value: {triage}");
+        }
+        let count = ids.len();
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt =
+                        tx.prepare_cached("UPDATE findings SET triage = ?2 WHERE id = ?1")?;
+                    for id in &ids {
+                        stmt.execute(rusqlite::params![id, triage])?;
+                    }
+                }
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await?;
+        Ok(count)
+    }
+
+    /// Persist export inventory + misconfig rows for a scan. Idempotent via
+    /// the UNIQUE constraints on the `exports`/`misconfigs` tables.
+    pub async fn insert_exports(
+        &self,
+        scan_id: i64,
+        exports: Vec<crate::pipeline::ExportMsg>,
+    ) -> Result<()> {
+        if exports.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                {
+                    let mut ex_stmt = tx.prepare_cached(
+                        "INSERT OR IGNORE INTO exports \
+                         (scan_id, host, export_path, nfs_version, allowed_hosts) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+                    let mut mc_stmt = tx.prepare_cached(
+                        "INSERT OR IGNORE INTO misconfigs \
+                         (scan_id, host, export_path, kind) VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for e in &exports {
+                        let nfs_version = match e.nfs_version {
+                            crate::nfs::NfsVersion::V3 => "v3",
+                            crate::nfs::NfsVersion::V4 => "v4",
+                        };
+                        let allowed = if e.access_options.allowed_hosts.is_empty() {
+                            None
+                        } else {
+                            Some(e.access_options.allowed_hosts.join(","))
+                        };
+                        ex_stmt.execute(rusqlite::params![
+                            scan_id,
+                            e.host,
+                            e.export_path,
+                            nfs_version,
+                            allowed
+                        ])?;
+                        for mc in &e.misconfigs {
+                            mc_stmt.execute(rusqlite::params![
+                                scan_id,
+                                e.host,
+                                e.export_path,
+                                mc.to_string()
+                            ])?;
+                        }
+                    }
+                }
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn complete_scan(&self, scan_id: i64, stats: &PipelineStats) -> Result<()> {
         let total_hosts = stats.hosts_scanned.load(Ordering::Relaxed) as i64;
         let total_exports = stats.exports_found.load(Ordering::Relaxed) as i64;
@@ -171,7 +256,7 @@ mod tests {
 
     use crate::classifier::Triage;
     use crate::pipeline::PipelineStats;
-    use crate::web::db::test_helpers::{self, make_test_result};
+    use crate::web::db::test_helpers::{self, make_test_result, seed_test_data};
     use crate::web::db::{Database, FindingsQuery};
     use rusqlite::params;
 
@@ -392,5 +477,48 @@ mod tests {
 
         let count = db.count_findings(&FindingsQuery::default()).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_set_triage() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = seed_test_data(&db).await;
+        let all = db
+            .list_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                per_page: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids: Vec<i64> = all.iter().take(2).map(|f| f.id).collect();
+
+        let n = db
+            .bulk_set_triage(ids.clone(), "Black".to_string())
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+
+        for id in ids {
+            let f = db.finding_by_id(id).await.unwrap().unwrap();
+            assert_eq!(f.triage, "Black");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bulk_set_triage_rejects_invalid() {
+        let db = Database::open_memory().await.unwrap();
+        let scan_id = seed_test_data(&db).await;
+        let all = db
+            .list_findings(&FindingsQuery {
+                scan_id: Some(scan_id),
+                per_page: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids = vec![all[0].id];
+        let result = db.bulk_set_triage(ids, "Purple".to_string()).await;
+        assert!(result.is_err(), "invalid triage value must be rejected");
     }
 }

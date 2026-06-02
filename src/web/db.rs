@@ -3,9 +3,7 @@ mod query;
 mod schema;
 mod write;
 
-use serde::Serialize;
-
-// ── Query enums ──────────────────────────────────────────────
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortColumn {
@@ -58,8 +56,6 @@ pub enum ShowFilter {
     Unreviewed,
 }
 
-// ── Result structs ───────────────────────────────────────────
-
 #[derive(Debug, serde::Serialize)]
 pub struct ScanStats {
     pub total_findings: i64,
@@ -68,7 +64,7 @@ pub struct ScanStats {
     pub severity_counts: std::collections::HashMap<String, i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub id: i64,
     pub scan_id: i64,
@@ -87,6 +83,13 @@ pub struct Finding {
     pub last_modified: String,
     pub starred: bool,
     pub reviewed: bool,
+}
+
+/// A run of finding `context` text, flagged as whether it is the matched
+/// pattern (for `<mark>` highlighting in the evidence viewer).
+pub struct ContextSegment {
+    pub text: String,
+    pub is_match: bool,
 }
 
 /// Format an RFC3339 timestamp to a short human-readable form: "Apr 10, 00:22"
@@ -167,6 +170,46 @@ impl Finding {
     pub fn display_timestamp(&self) -> String {
         format_short_time(&self.timestamp)
     }
+
+    /// Split the stored `context` snippet on literal occurrences of
+    /// `matched_pattern` so the template can wrap matches in `<mark>`.
+    /// Empty vec when there is no context; a single non-match segment when
+    /// the pattern is empty or absent.
+    #[must_use]
+    pub fn context_segments(&self) -> Vec<ContextSegment> {
+        let Some(ctx) = self.context.as_deref() else {
+            return Vec::new();
+        };
+        let pat = self.matched_pattern.as_str();
+        if pat.is_empty() || !ctx.contains(pat) {
+            return vec![ContextSegment {
+                text: ctx.to_string(),
+                is_match: false,
+            }];
+        }
+        let mut out = Vec::new();
+        let mut rest = ctx;
+        while let Some(idx) = rest.find(pat) {
+            if idx > 0 {
+                out.push(ContextSegment {
+                    text: rest[..idx].to_string(),
+                    is_match: false,
+                });
+            }
+            out.push(ContextSegment {
+                text: pat.to_string(),
+                is_match: true,
+            });
+            rest = &rest[idx + pat.len()..];
+        }
+        if !rest.is_empty() {
+            out.push(ContextSegment {
+                text: rest.to_string(),
+                is_match: false,
+            });
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,7 +263,23 @@ pub struct ExportCount {
     pub count: u64,
 }
 
-// ── Query parameters ─────────────────────────────────────────
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExportRecord {
+    pub host: String,
+    pub export_path: String,
+    pub nfs_version: String,
+    pub allowed_hosts: Option<String>,
+    pub misconfigs: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopologyExport {
+    pub export_path: String,
+    pub nfs_version: Option<String>,
+    pub allowed_hosts: Option<String>,
+    pub misconfigs: Vec<String>,
+    pub finding_count: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct FindingsQuery {
@@ -510,5 +569,76 @@ mod tests {
     fn test_display_context_preview_short_string_unchanged() {
         let f = finding_with_context(Some("short"));
         assert_eq!(f.display_context_preview(), "short");
+    }
+}
+
+#[cfg(test)]
+mod context_segment_tests {
+    use super::*;
+
+    fn finding_with(context: Option<&str>, matched: &str) -> Finding {
+        Finding {
+            id: 1,
+            scan_id: 1,
+            timestamp: "2026-05-30T14:00:00Z".into(),
+            host: "10.0.0.1".into(),
+            export_path: "/exports".into(),
+            file_path: "/file".into(),
+            triage: "Red".into(),
+            rule_name: "Rule".into(),
+            matched_pattern: matched.into(),
+            context: context.map(|s| s.into()),
+            file_size: 1,
+            file_mode: 0o644,
+            file_uid: 0,
+            file_gid: 0,
+            last_modified: "2026-05-30T14:00:00Z".into(),
+            starred: false,
+            reviewed: false,
+        }
+    }
+
+    #[test]
+    fn splits_around_single_match() {
+        let f = finding_with(Some("before SECRET after"), "SECRET");
+        let segs = f.context_segments();
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].text, "before ");
+        assert!(!segs[0].is_match);
+        assert_eq!(segs[1].text, "SECRET");
+        assert!(segs[1].is_match);
+        assert_eq!(segs[2].text, " after");
+        assert!(!segs[2].is_match);
+    }
+
+    #[test]
+    fn handles_multiple_matches() {
+        let f = finding_with(Some("AAxAA"), "AA");
+        let segs = f.context_segments();
+        let matches: Vec<_> = segs.iter().filter(|s| s.is_match).collect();
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn no_match_returns_whole_context() {
+        let f = finding_with(Some("nothing here"), "ZZZ");
+        let segs = f.context_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(!segs[0].is_match);
+        assert_eq!(segs[0].text, "nothing here");
+    }
+
+    #[test]
+    fn none_context_returns_empty() {
+        let f = finding_with(None, "X");
+        assert!(f.context_segments().is_empty());
+    }
+
+    #[test]
+    fn empty_pattern_returns_whole_context() {
+        let f = finding_with(Some("abc"), "");
+        let segs = f.context_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(!segs[0].is_match);
     }
 }

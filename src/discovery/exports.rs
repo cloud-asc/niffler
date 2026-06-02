@@ -34,7 +34,11 @@ pub async fn list_exports(
     let mount_port = pm
         .getport(100_005, 3)
         .await
-        .context("MOUNT service not registered")?;
+        .context("MOUNT service query failed")?;
+    // portmapper returns port 0 for an unregistered service; don't try to connect.
+    if mount_port == 0 {
+        anyhow::bail!("MOUNT service not registered");
+    }
 
     let mount_stream = timeout(
         Duration::from_secs(timeout_secs),

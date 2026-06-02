@@ -3,6 +3,18 @@ use crate::nfs::types::{DirEntry, NfsAttrs, NfsFh, ReadResult};
 /// Result alias for NFS operations.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Default per-directory entry cap. Bounds client memory when a malicious or
+/// misconfigured server returns a directory with a pathological number of
+/// entries. `0` disables the cap.
+pub const DEFAULT_MAX_DIR_ENTRIES: usize = 1_000_000;
+
+/// Returns true once an accumulated directory listing has reached `cap`.
+/// A `cap` of 0 means unlimited.
+#[must_use]
+pub(crate) fn dir_entry_cap_reached(len: usize, cap: usize) -> bool {
+    cap != 0 && len >= cap
+}
+
 /// Operations on an established NFS connection.
 /// The connection holds a mounted export and fixed AUTH_SYS credentials.
 /// All async methods take &mut self because nfs3_client requires exclusive access.
@@ -32,6 +44,19 @@ pub trait NfsOps: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_disabled_when_zero() {
+        assert!(!dir_entry_cap_reached(0, 0));
+        assert!(!dir_entry_cap_reached(1_000_000, 0));
+    }
+
+    #[test]
+    fn cap_reached_at_or_above_limit() {
+        assert!(!dir_entry_cap_reached(99, 100));
+        assert!(dir_entry_cap_reached(100, 100));
+        assert!(dir_entry_cap_reached(101, 100));
+    }
 
     #[tokio::test]
     async fn mock_nfs_ops_compiles() {
