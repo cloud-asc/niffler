@@ -77,6 +77,34 @@ pub struct NfsExport {
     pub allowed_hosts: Vec<String>,
 }
 
+/// Partial attribute update for SETATTR. `None` fields are left unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetAttrs {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+    pub mtime: Option<u64>,
+}
+
+/// Special-file kind for `mknod`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Block,
+    Char,
+    Fifo,
+    Socket,
+}
+
+/// Filesystem statistics (FSSTAT), backing the shell's `df`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsStat {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Bytes available to the calling (possibly spoofed) user.
+    pub avail_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,

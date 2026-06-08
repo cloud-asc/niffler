@@ -1,17 +1,20 @@
 //! NFSv4 operations on a mounted libnfs context.
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Arc;
 
 use crate::nfs::errors::NfsError;
 use crate::nfs::ops::NfsOps;
-use crate::nfs::types::{DirEntry, NfsAttrs, NfsFh, NfsFileType, ReadResult};
+use crate::nfs::types::{
+    DirEntry, FsStat, NfsAttrs, NfsFh, NfsFileType, NodeKind, ReadResult, SetAttrs,
+};
 
 use super::ffi::{
-    LibnfsContext, get_libnfs_error, map_libnfs_error, nfs_close, nfs_closedir, nfs_context,
-    nfs_open, nfs_opendir, nfs_pread, nfs_readdir, nfs_readlink2, nfs_stat_64, nfs_stat64, nfsdir,
-    nfsfh,
+    LibnfsContext, get_libnfs_error, map_libnfs_error, nfs_chmod, nfs_chown, nfs_close,
+    nfs_closedir, nfs_context, nfs_creat, nfs_link, nfs_lstat64, nfs_mkdir2, nfs_mknod, nfs_open,
+    nfs_opendir, nfs_pread, nfs_pwrite, nfs_readdir, nfs_readlink2, nfs_rename, nfs_rmdir,
+    nfs_stat_64, nfs_stat64, nfs_statvfs, nfs_symlink, nfs_truncate, nfs_unlink, nfsdir, nfsfh,
 };
 
 // Platform-portable mode constants (libc types: u16 on macOS, u32 on Linux).
@@ -98,6 +101,33 @@ impl Nfs4Ops {
             root_fh,
             max_dir_entries,
         }
+    }
+
+    async fn unary_path_op<F>(&mut self, path: String, call: F) -> crate::nfs::ops::Result<()>
+    where
+        F: FnOnce(*mut nfs_context, *const c_char) -> c_int + Send + 'static,
+    {
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // The closure performs the unsafe libnfs FFI call; the caller's `unsafe`
+            // block carries the safety obligation. `ptr` and `c_path` are valid here:
+            // the mutex is held and `c_path` outlives the synchronous call.
+            let ret = call(ptr, c_path.as_ptr());
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(join_err)?
     }
 }
 
@@ -433,6 +463,402 @@ impl NfsOps for Nfs4Ops {
                 .into_owned();
 
             Ok(target)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn create(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        mode: u32,
+    ) -> crate::nfs::ops::Result<(NfsFh, NfsAttrs)> {
+        let full_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        let ctx = Arc::clone(&self.ctx);
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(full_path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+
+            let mut fh: *mut nfsfh = std::ptr::null_mut();
+            // SAFETY: ptr is a valid mounted context; c_path is a valid C string; fh written on success.
+            let ret =
+                unsafe { nfs_creat(ptr, c_path.as_ptr(), mode as std::os::raw::c_int, &mut fh) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let creat_guard = FileHandleGuard { ctx: ptr, fh };
+            drop(creat_guard);
+
+            let mut st = nfs_stat_64::default();
+            let c_stat = CString::new(full_path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: ptr valid; c_stat valid C string; st valid out-param.
+            let sret = unsafe { nfs_stat64(ptr, c_stat.as_ptr(), &mut st) };
+            if sret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(sret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok((path_to_nfsfh(&full_path), stat_to_nfsattrs(&st)))
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn write(
+        &mut self,
+        fh: &NfsFh,
+        offset: u64,
+        data: &[u8],
+        _stable: bool,
+    ) -> crate::nfs::ops::Result<u32> {
+        let path = nfsfh_to_path(fh);
+        let ctx = Arc::clone(&self.ctx);
+        let buf = data.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+
+            let mut file_handle: *mut nfsfh = std::ptr::null_mut();
+            // SAFETY: ptr valid; c_path valid; file_handle written on success. O_WRONLY opens for writing.
+            let ret = unsafe { nfs_open(ptr, c_path.as_ptr(), libc::O_WRONLY, &mut file_handle) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let file_guard = FileHandleGuard {
+                ctx: ptr,
+                fh: file_handle,
+            };
+
+            // SAFETY: ptr and file_handle valid; buf has buf.len() readable bytes.
+            // libnfs arg order is (offset, count, buf) — same OLD-API convention as nfs_pread.
+            let written = unsafe {
+                nfs_pwrite(
+                    ptr,
+                    file_handle,
+                    offset,
+                    buf.len() as u64,
+                    buf.as_ptr() as *const c_void,
+                )
+            };
+            let err_msg = if written < 0 {
+                Some(get_libnfs_error(ptr))
+            } else {
+                None
+            };
+            drop(file_guard);
+            if let Some(msg) = err_msg {
+                return Err(Box::new(map_libnfs_error(written, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            // nfs_pwrite returns c_int; a non-negative result fits in u32 (i32::MAX < u32::MAX).
+            Ok(written as u32)
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn mkdir(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        mode: u32,
+    ) -> crate::nfs::ops::Result<(NfsFh, NfsAttrs)> {
+        let full_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        let ctx = Arc::clone(&self.ctx);
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(full_path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: ptr valid; c_path valid C string.
+            let ret = unsafe { nfs_mkdir2(ptr, c_path.as_ptr(), mode as std::os::raw::c_int) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let mut st = nfs_stat_64::default();
+            // SAFETY: ptr valid; c_path valid; st valid out-param.
+            let sret = unsafe { nfs_stat64(ptr, c_path.as_ptr(), &mut st) };
+            if sret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(sret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok((path_to_nfsfh(&full_path), stat_to_nfsattrs(&st)))
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn remove(&mut self, dir: &NfsFh, name: &str) -> crate::nfs::ops::Result<()> {
+        let full_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        // SAFETY: ptr and c are valid for the duration of the call.
+        self.unary_path_op(full_path, |ptr, c| unsafe { nfs_unlink(ptr, c) })
+            .await
+    }
+
+    async fn rmdir(&mut self, dir: &NfsFh, name: &str) -> crate::nfs::ops::Result<()> {
+        let full_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        // SAFETY: ptr and c are valid for the duration of the call.
+        self.unary_path_op(full_path, |ptr, c| unsafe { nfs_rmdir(ptr, c) })
+            .await
+    }
+
+    async fn setattr(&mut self, fh: &NfsFh, attrs: SetAttrs) -> crate::nfs::ops::Result<()> {
+        let path = nfsfh_to_path(fh);
+        let ctx = Arc::clone(&self.ctx);
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+
+            let check = |ret: c_int| -> crate::nfs::ops::Result<()> {
+                if ret != 0 {
+                    let msg = get_libnfs_error(ptr);
+                    Err(Box::new(map_libnfs_error(ret, &msg))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Ok(())
+                }
+            };
+
+            if let Some(mode) = attrs.mode {
+                // SAFETY: ptr valid; c_path valid C string.
+                check(unsafe { nfs_chmod(ptr, c_path.as_ptr(), mode as c_int) })?;
+            }
+            if attrs.uid.is_some() || attrs.gid.is_some() {
+                let uid = attrs.uid.map_or(-1, |u| u as c_int);
+                let gid = attrs.gid.map_or(-1, |g| g as c_int);
+                // SAFETY: ptr valid; c_path valid. -1 means "leave unchanged" per chown semantics.
+                check(unsafe { nfs_chown(ptr, c_path.as_ptr(), uid, gid) })?;
+            }
+            if let Some(size) = attrs.size {
+                // SAFETY: ptr valid; c_path valid.
+                check(unsafe { nfs_truncate(ptr, c_path.as_ptr(), size) })?;
+            }
+            // mtime is honored on v3 only; libnfs has no portable utimes here.
+            Ok(())
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn fsstat(&mut self, fh: &NfsFh) -> crate::nfs::ops::Result<FsStat> {
+        let path = nfsfh_to_path(fh);
+        let ctx = Arc::clone(&self.ctx);
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: zeroed statvfs is a valid initial state for an out-param.
+            let mut svfs: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: ptr valid; c_path valid; svfs valid out-param. libnfs arg order is (nfs, path, svfs).
+            let ret = unsafe { nfs_statvfs(ptr, c_path.as_ptr(), &mut svfs) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let bsize = svfs.f_frsize as u64;
+            Ok(FsStat {
+                total_bytes: (svfs.f_blocks as u64).saturating_mul(bsize),
+                free_bytes: (svfs.f_bfree as u64).saturating_mul(bsize),
+                avail_bytes: (svfs.f_bavail as u64).saturating_mul(bsize),
+            })
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn rename(
+        &mut self,
+        from_dir: &NfsFh,
+        from_name: &str,
+        to_dir: &NfsFh,
+        to_name: &str,
+    ) -> crate::nfs::ops::Result<()> {
+        let old = format!(
+            "{}/{}",
+            nfsfh_to_path(from_dir).trim_end_matches('/'),
+            from_name
+        );
+        let new = format!(
+            "{}/{}",
+            nfsfh_to_path(to_dir).trim_end_matches('/'),
+            to_name
+        );
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_old = CString::new(old.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            let c_new = CString::new(new.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: ptr valid; both C strings valid for the call.
+            let ret = unsafe { nfs_rename(ptr, c_old.as_ptr(), c_new.as_ptr()) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn link(
+        &mut self,
+        target: &NfsFh,
+        dir: &NfsFh,
+        name: &str,
+    ) -> crate::nfs::ops::Result<()> {
+        let old = nfsfh_to_path(target);
+        let new = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_old = CString::new(old.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            let c_new = CString::new(new.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: ptr valid; both C strings valid for the call.
+            let ret = unsafe { nfs_link(ptr, c_old.as_ptr(), c_new.as_ptr()) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn symlink(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        target_path: &str,
+        _mode: u32,
+    ) -> crate::nfs::ops::Result<(NfsFh, NfsAttrs)> {
+        let link_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        let target = target_path.to_string();
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_target = CString::new(target.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            let c_link = CString::new(link_path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            // SAFETY: ptr valid; both C strings valid. libnfs arg order is (target, linkpath).
+            let ret = unsafe { nfs_symlink(ptr, c_target.as_ptr(), c_link.as_ptr()) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let mut st = nfs_stat_64::default();
+            // SAFETY: ptr valid; c_link valid; st valid out-param. nfs_lstat64 does NOT follow the
+            // symlink, so attrs describe the link itself (matching the v3 path).
+            let sret = unsafe { nfs_lstat64(ptr, c_link.as_ptr(), &mut st) };
+            if sret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(sret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok((path_to_nfsfh(&link_path), stat_to_nfsattrs(&st)))
+        })
+        .await
+        .map_err(join_err)?
+    }
+
+    async fn mknod(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        kind: NodeKind,
+        mode: u32,
+        spec: Option<(u32, u32)>,
+    ) -> crate::nfs::ops::Result<(NfsFh, NfsAttrs)> {
+        // Block/char device nodes are not reliably expressible through libnfs's
+        // portable surface; this is a documented v3-only capability.
+        // libc mode constants are u16 on macOS but u32 on Linux, so the cast is
+        // required on one platform and redundant on the other.
+        #[allow(clippy::unnecessary_cast)]
+        let node_bits = match kind {
+            NodeKind::Block | NodeKind::Char => {
+                return Err(box_err(NfsError::ExportFatal(
+                    "block/char device nodes are not supported on NFSv4 (use NFSv3)".into(),
+                )));
+            }
+            NodeKind::Fifo => libc::S_IFIFO as u32,
+            NodeKind::Socket => libc::S_IFSOCK as u32,
+        };
+        let _ = spec;
+        let full_path = format!("{}/{}", nfsfh_to_path(dir).trim_end_matches('/'), name);
+        let ctx = Arc::clone(&self.ctx);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ptr = guard.as_ptr();
+            let c_path = CString::new(full_path.as_str())
+                .map_err(|_| box_err(NfsError::ExportFatal("invalid path".into())))?;
+            let full_mode = (node_bits | (mode & 0o7777)) as c_int;
+            // SAFETY: ptr valid; c_path valid. dev=0 for fifo/socket.
+            let ret = unsafe { nfs_mknod(ptr, c_path.as_ptr(), full_mode, 0) };
+            if ret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(ret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let mut st = nfs_stat_64::default();
+            // SAFETY: ptr valid; c_path valid; st valid out-param.
+            let sret = unsafe { nfs_stat64(ptr, c_path.as_ptr(), &mut st) };
+            if sret != 0 {
+                let msg = get_libnfs_error(ptr);
+                return Err(Box::new(map_libnfs_error(sret, &msg))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok((path_to_nfsfh(&full_path), stat_to_nfsattrs(&st)))
         })
         .await
         .map_err(join_err)?

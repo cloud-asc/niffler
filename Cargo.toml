@@ -1,8 +1,8 @@
 [package]
 name = "niffler"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
-description = "NFS share secret finder"
+description = "NFS share secret finder and interactive client"
 license = "MIT"
 rust-version = "1.95"
 
@@ -52,6 +52,7 @@ tokio-rusqlite = { version = "0.7", features = ["bundled-full"] }
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 rust-embed = "8"
 mockall = { version = "0.14", optional = true }
+rustyline = "15"
 
 [build-dependencies]
 pkg-config = "0.3"

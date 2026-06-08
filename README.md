@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 
-Niffler scans NFS servers for credentials, secrets, and misconfigurations. Think [Snaffler](https://github.com/SnaffCon/Snaffler), but for NFS instead of SMB.
+Niffler scans NFS servers for credentials, secrets, and misconfigurations. It also gives you an interactive client to explore the shares it finds by hand.
 
 ## Why NFS?
 
@@ -61,6 +61,18 @@ Niffler runs in three modes, so you can dial in how deep you want to go:
 | `recon` | Finds NFS servers, lists exports, checks for misconfigurations | You want a quiet lay of the land |
 | `enum` | Above + walks directory trees, matches filenames against rules | You want to see what's there without reading file content |
 | `scan` | Above + reads file content and applies regex patterns | You want the full picture (default) |
+
+## Interactive shell
+
+`niffler shell` opens an interactive NFS client
+
+```bash
+# Connect and mount on startup
+./niffler shell -t 10.0.0.5 -e /export --uid 1000
+
+# Drive it non-interactively
+./niffler shell -t 10.0.0.5 -c "mount /export; ls -l; cat /etc/hostname"
+```
 
 ## Recipes
 
@@ -252,3 +264,7 @@ The subtree bypass check is off by default since it adds an extra probe per expo
 ```bash
 ./niffler scan -t 10.0.0.0/24 --check-subtree-bypass
 ```
+
+## Acknowledgements
+
+Niffler borrows ideas, not code, from two projects. [Snaffler](https://github.com/SnaffCon/Snaffler) does this for SMB, and its relay-chain rule engine inspired the secret-matching here. [nfsshell](https://github.com/NetDirect/nfsshell) is the classic interactive NFS client, and the `shell` command is modeled on it.

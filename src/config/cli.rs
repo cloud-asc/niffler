@@ -6,7 +6,10 @@ use crate::classifier::Triage;
 use crate::config::settings::{ExportFormat, OperatingMode};
 
 #[derive(Parser)]
-#[command(name = "niffler", about = "NFS share secret finder")]
+#[command(
+    name = "niffler",
+    about = "NFS share secret finder and interactive client"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: NifflerCommand,
@@ -20,6 +23,8 @@ pub struct Cli {
 pub enum NifflerCommand {
     /// Scan NFS shares for secrets
     Scan(Box<ScanArgs>),
+    /// Interactive NFS client shell
+    Shell(Box<ShellArgs>),
     /// Launch web dashboard for interactive triage
     Serve {
         /// Path to SQLite database
@@ -230,6 +235,50 @@ pub struct ScanArgs {
     pub config: Option<PathBuf>,
 }
 
+/// Interactive NFS client shell.
+#[derive(Args, Debug)]
+pub struct ShellArgs {
+    /// Target NFS server host (can also be set later with `open`).
+    #[arg(short = 't', long)]
+    pub target: Option<String>,
+
+    /// Export to mount on startup (requires --target).
+    #[arg(short = 'e', long)]
+    pub export: Option<String>,
+
+    /// UID to present via AUTH_SYS.
+    #[arg(long, default_value = "65534")]
+    pub uid: u32,
+
+    /// GID to present via AUTH_SYS.
+    #[arg(long, default_value = "65534")]
+    pub gid: u32,
+
+    /// Force NFS protocol version (3 or 4); auto-detect if unset.
+    #[arg(long)]
+    pub nfs_version: Option<u8>,
+
+    /// Connect from an unprivileged source port.
+    #[arg(long)]
+    pub no_privileged_port: bool,
+
+    /// SOCKS5 proxy URL, e.g. socks5://127.0.0.1:1080 (v3 only).
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Per-directory entry cap for listings (0 = unlimited).
+    #[arg(long, default_value = "1000000")]
+    pub max_dir_entries: usize,
+
+    /// SQLite database for `snaffle` (used by a later plan).
+    #[arg(short = 'o', long, default_value = "niffler.db")]
+    pub db: PathBuf,
+
+    /// Run a semicolon/newline-separated command string non-interactively, then exit.
+    #[arg(short = 'c', long)]
+    pub command: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Verbosity {
     Trace,
@@ -368,5 +417,31 @@ mod tests {
     fn live_flag_removed() {
         let r = Cli::try_parse_from(["niffler", "scan", "-t", "10.0.0.1", "--live"]);
         assert!(r.is_err(), "--live should no longer be accepted");
+    }
+
+    #[test]
+    fn parses_shell_subcommand() {
+        let cli = Cli::try_parse_from([
+            "niffler", "shell", "-t", "10.0.0.5", "-e", "/export", "--uid", "1000",
+        ])
+        .unwrap();
+        match cli.command {
+            NifflerCommand::Shell(args) => {
+                assert_eq!(args.target.as_deref(), Some("10.0.0.5"));
+                assert_eq!(args.export.as_deref(), Some("/export"));
+                assert_eq!(args.uid, 1000);
+                assert_eq!(args.gid, 65534);
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    #[test]
+    fn shell_command_string_parses() {
+        let cli = Cli::try_parse_from(["niffler", "shell", "-c", "ls; cat foo"]).unwrap();
+        match cli.command {
+            NifflerCommand::Shell(args) => assert_eq!(args.command.as_deref(), Some("ls; cat foo")),
+            _ => panic!("expected Shell"),
+        }
     }
 }

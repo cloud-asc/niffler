@@ -1,4 +1,4 @@
-use crate::nfs::types::{DirEntry, NfsAttrs, NfsFh, ReadResult};
+use crate::nfs::types::{DirEntry, FsStat, NfsAttrs, NfsFh, NodeKind, ReadResult, SetAttrs};
 
 /// Result alias for NFS operations.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -36,6 +36,59 @@ pub trait NfsOps: Send {
 
     /// Read symlink target.
     async fn readlink(&mut self, link: &NfsFh) -> Result<String>;
+
+    /// Write `data` at `offset`. `stable` requests FILE_SYNC durability.
+    /// Returns the number of bytes the server reports written.
+    async fn write(&mut self, fh: &NfsFh, offset: u64, data: &[u8], stable: bool) -> Result<u32>;
+
+    /// Create regular file `name` in `dir` with `mode`. Returns its handle and attrs.
+    async fn create(&mut self, dir: &NfsFh, name: &str, mode: u32) -> Result<(NfsFh, NfsAttrs)>;
+
+    /// Create directory `name` in `dir` with `mode`. Returns its handle and attrs.
+    async fn mkdir(&mut self, dir: &NfsFh, name: &str, mode: u32) -> Result<(NfsFh, NfsAttrs)>;
+
+    /// Remove file `name` from `dir`.
+    async fn remove(&mut self, dir: &NfsFh, name: &str) -> Result<()>;
+
+    /// Remove empty directory `name` from `dir`.
+    async fn rmdir(&mut self, dir: &NfsFh, name: &str) -> Result<()>;
+
+    /// Apply a partial attribute update (chmod/chown/truncate/utime).
+    async fn setattr(&mut self, fh: &NfsFh, attrs: SetAttrs) -> Result<()>;
+
+    /// Filesystem statistics for the volume containing `fh` (FSSTAT).
+    async fn fsstat(&mut self, fh: &NfsFh) -> Result<FsStat>;
+
+    /// Rename `from_name` in `from_dir` to `to_name` in `to_dir`.
+    async fn rename(
+        &mut self,
+        from_dir: &NfsFh,
+        from_name: &str,
+        to_dir: &NfsFh,
+        to_name: &str,
+    ) -> Result<()>;
+
+    /// Create a hard link `name` in `dir` pointing at existing `target`.
+    async fn link(&mut self, target: &NfsFh, dir: &NfsFh, name: &str) -> Result<()>;
+
+    /// Create symlink `name` in `dir` whose contents are `target_path`.
+    async fn symlink(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        target_path: &str,
+        mode: u32,
+    ) -> Result<(NfsFh, NfsAttrs)>;
+
+    /// Create a special file (block/char/fifo/socket). `spec` = (major, minor) for device nodes.
+    async fn mknod(
+        &mut self,
+        dir: &NfsFh,
+        name: &str,
+        kind: NodeKind,
+        mode: u32,
+        spec: Option<(u32, u32)>,
+    ) -> Result<(NfsFh, NfsAttrs)>;
 
     /// Get the root file handle for the mounted export.
     fn root_handle(&self) -> &NfsFh;

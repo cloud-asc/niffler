@@ -2,6 +2,7 @@ pub mod export;
 pub mod sqlite;
 pub mod types;
 
+pub use sqlite::SqliteWriter;
 pub use types::DeduplicationKey;
 pub use types::file_mode_to_rwx;
 
@@ -14,8 +15,6 @@ use tokio::sync::mpsc;
 use crate::config::OutputConfig;
 use crate::pipeline::{ExportMsg, PipelineStats, ResultMsg};
 use crate::tui::{FindingEvent, ReporterHandle};
-
-use self::sqlite::SqliteWriter;
 
 /// Async output sink — reads `ResultMsg` and `ExportMsg` from the pipeline
 /// channels, writes findings and export metadata to SQLite, and tees findings

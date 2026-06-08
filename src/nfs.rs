@@ -14,8 +14,8 @@ pub use errors::{ErrorClass, NfsError, classify_error};
 pub use ops::NfsOps;
 pub use socks::SocksConnector;
 pub use types::{
-    DirEntry, ExportAccessOptions, Misconfiguration, NfsAttrs, NfsExport, NfsFh, NfsFileType,
-    NfsVersion, ReadResult,
+    DirEntry, ExportAccessOptions, FsStat, Misconfiguration, NfsAttrs, NfsExport, NfsFh,
+    NfsFileType, NfsVersion, NodeKind, ReadResult, SetAttrs,
 };
 pub use v3::Nfs3Connector;
 pub use v4::Nfs4Connector;

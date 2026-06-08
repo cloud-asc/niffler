@@ -113,6 +113,12 @@ unsafe extern "C" {
         st: *mut nfs_stat_64,
     ) -> c_int;
 
+    pub(super) fn nfs_lstat64(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        st: *mut nfs_stat_64,
+    ) -> c_int;
+
     pub(super) fn nfs_opendir(
         nfs: *mut nfs_context,
         path: *const c_char,
@@ -144,6 +150,62 @@ unsafe extern "C" {
         nfs: *mut nfs_context,
         path: *const c_char,
         bufptr: *mut *mut c_char,
+    ) -> c_int;
+
+    pub(super) fn nfs_pwrite(
+        nfs: *mut nfs_context,
+        nfsfh: *mut nfsfh,
+        offset: u64,
+        count: u64,
+        buf: *const c_void,
+    ) -> c_int;
+
+    pub(super) fn nfs_creat(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        mode: c_int,
+        nfsfh: *mut *mut nfsfh,
+    ) -> c_int;
+
+    pub(super) fn nfs_mkdir2(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
+    pub(super) fn nfs_unlink(nfs: *mut nfs_context, path: *const c_char) -> c_int;
+    pub(super) fn nfs_rmdir(nfs: *mut nfs_context, path: *const c_char) -> c_int;
+
+    pub(super) fn nfs_chmod(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
+    pub(super) fn nfs_chown(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        uid: c_int,
+        gid: c_int,
+    ) -> c_int;
+    pub(super) fn nfs_truncate(nfs: *mut nfs_context, path: *const c_char, length: u64) -> c_int;
+
+    pub(super) fn nfs_rename(
+        nfs: *mut nfs_context,
+        oldpath: *const c_char,
+        newpath: *const c_char,
+    ) -> c_int;
+    pub(super) fn nfs_link(
+        nfs: *mut nfs_context,
+        oldpath: *const c_char,
+        newpath: *const c_char,
+    ) -> c_int;
+    pub(super) fn nfs_symlink(
+        nfs: *mut nfs_context,
+        target: *const c_char,
+        linkpath: *const c_char,
+    ) -> c_int;
+    pub(super) fn nfs_mknod(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        mode: c_int,
+        dev: c_int,
+    ) -> c_int;
+
+    pub(super) fn nfs_statvfs(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        svfs: *mut libc::statvfs,
     ) -> c_int;
 }
 
